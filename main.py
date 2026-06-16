@@ -120,87 +120,6 @@ def richiedi_data_limite():
 # METODO DI CONTROLLO E AVVIO RICERCA
 # =====================================================================
 
-'''
-Vecchia versione, non gestisce CIG multipli per i bandi
-def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="qualsiasi", contraente="qualsiasi", data_limite=None, nome_file=None):
-    codice_stato = MAPPA_STATO[stato]
-    codice_tipologia = MAPPA_TIPOLOGIA[tipologia]
-    codice_contraente = MAPPA_CONTRAENTE[contraente]
-
-    filtri_attivi = []
-    if parola_chiave: filtri_attivi.append(f"Oggetto/Parola chiave: '{parola_chiave}'")
-    if cig: filtri_attivi.append(f"CIG: '{cig}'")
-    if stato != "qualsiasi": filtri_attivi.append(f"Stato: '{stato}' (Codice: {codice_stato})")
-    if tipologia != "qualsiasi": filtri_attivi.append(f"Tipologia: '{tipologia}' (Codice: {codice_tipologia})")
-    if contraente != "qualsiasi": filtri_attivi.append(f"Scelta Contraente: '{contraente}' (Codice: {codice_contraente})")
-    if data_limite: filtri_attivi.append(f"Pubblicati dal: '{data_limite}'")
-
-    print("\n[+] Avvio ricerca sul sito...")
-    if filtri_attivi:
-        print("  Filtri applicati:")
-        for f in filtri_attivi: print(f"    -> {f}")
-    else:
-        print("  Nessun filtro specifico inserito (mostro tutti i bandi)")
-
-    url_ricerca = genera_url_con_filtri(
-        parola_chiave=parola_chiave, cig=cig, stato=codice_stato,
-        tipologia=codice_tipologia, contraente=codice_contraente
-    )
-
-    elenco_link = estrai_lista_bandi(url_ricerca, data_limite=data_limite)
-
-    print(f"\n[+] Trovati {len(elenco_link)} bandi corrispondenti ai filtri e alle date.")
-    print("[+] Avvio estrazione dettagli dalle singole pagine...\n")
-
-    lista_risultati = []  # Lista che accumula tutti i bandi
-
-    for i, link in enumerate(elenco_link, 1):
-        if i > 1:
-            time.sleep(2)
-
-        url_completo = f"{BASE_URL}{link}" if not link.startswith("http") else link
-        print(f"[{i}] Analizzo: {url_completo}")
-
-        dati_bando = estrai_dettagli_bando(url_completo)
-
-        # Stampe invariate...
-        print(f"    -> CIG: {dati_bando['cig']}")
-        print(f"    -> Tipologia Gara: {dati_bando['tipologia']}")
-        print(f"    -> Scelta Contraente: {dati_bando['scelta_contraente']}")
-        print(f"    -> Ente/Comune: {dati_bando['enti']}")
-        print(f"    -> Pubblicato il: {dati_bando['data_pubblicazione']}")
-        print(f"    -> Scadenza Manif. Interesse: {dati_bando['scadenza_manifestazione']}")
-        print(f"    -> Scadenza Gara: {dati_bando['data_scadenza']}")
-
-        dati_anac = {}
-        cig_bando = dati_bando.get("cig", "Non trovato")
-        if cig_bando != "Non trovato":
-            print(f"    [..] Recupero dati ANAC per CIG {cig_bando}...")
-            json_anac = scarica_json_anac(cig_bando)
-            if json_anac:
-                dati_anac = estrai_dati_json_anac(json_anac)
-                print(f"    -> [ANAC] Numero Gara: {dati_anac['numero_gara']}")
-                print(f"    -> [ANAC] Oggetto Gara: {dati_anac['oggetto_gara']}")
-                print(f"    -> [ANAC] CUP: {dati_anac['cup']}")
-                print(f"    -> [ANAC] CPV: {dati_anac['cod_cpv']} - {dati_anac['descrizione_cpv']}")
-                print(f"    -> [ANAC] Tipo Scelta Contraente: {dati_anac['tipo_scelta_contraente']}")
-                print(
-                    f"    -> [ANAC] Aggiudicatario: {dati_anac['aggiudicatario']} (CF: {dati_anac['aggiudicatario_cf']})")
-            else:
-                print("    -> [ANAC] Impossibile recuperare i dati.")
-
-        # Aggiungiamo il bando alla lista risultati
-        lista_risultati.append({
-            "provincia": dati_bando,
-            "anac": dati_anac
-        })
-
-        print("-" * 60)
-
-        # Salvataggio finale (fuori dal loop, allineato con il for)
-    if lista_risultati:
-        salva_in_excel(lista_risultati, nome_file=nome_file)
-'''
 
 def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="qualsiasi", contraente="qualsiasi", data_limite=None, nome_file=None):
     #Prende i codici mappati con i dizionari in cima al file
@@ -327,13 +246,29 @@ if __name__ == "__main__":
     # NUOVO: Chiediamo la data (Opzionale)
     scelta_data_limite = richiedi_data_limite()
 
-    # Chiedi il nome del file
-    nome_file = input("\nCome vuoi chiamare il file Excel? (premi INVIO per nome automatico): ").strip()
-    if nome_file:
-        if not nome_file.endswith(".xlsx"):
-            nome_file += ".xlsx"
-    else:
-        nome_file = None  # Verrà generato automaticamente con data e ora
+    # Logica per l'inserimento del nome
+    caratteri_vietati = {'/', '\\', ':', '*', '?', '"', '<', '>', '|'}
+
+    while True:
+        nome_file = input("\nCome vuoi chiamare il file Excel? (premi INVIO per nome automatico): ").strip()
+
+        if nome_file:
+            # Controlla se ci sono caratteri vietati
+            caratteri_trovati = [c for c in nome_file if c in caratteri_vietati]
+
+            if caratteri_trovati:
+                caratteri_unici = ", ".join(sorted(set(caratteri_trovati)))
+                print(f"Errore: il nome contiene caratteri non validi. Caratteri non consentiti: / \\ : * ? \" < > |. Riprova.")
+                continue  # Forza il ciclo a ricominciare da capo
+
+            if not nome_file.endswith(".xlsx"):
+                nome_file += ".xlsx"
+        else:
+            nome_file = None  # Verrà generato automaticamente con data e ora
+
+        break  # Nome valido o INVIO premuto: esce dal ciclo
+
+
 
     # Passiamo tutto (inclusa la data) all'avvio della ricerca
     avvia_ricerca_bandi(
@@ -347,4 +282,14 @@ if __name__ == "__main__":
 
     )
 
+'''
+Vecchio inserimento nome file
+    # Chiedi il nome del file
+    nome_file = input("\nCome vuoi chiamare il file Excel? (premi INVIO per nome automatico): ").strip()
+    if nome_file:
+        if not nome_file.endswith(".xlsx"):
+            nome_file += ".xlsx"
+    else:
+        nome_file = None  # Verrà generato automaticamente con data e ora
+'''
 
