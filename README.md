@@ -3,11 +3,12 @@
 Programma per estrarre automaticamente i bandi di gara pubblicati sul sito
 della Provincia di Pistoia (https://www.provincia.pistoia.it/gare), integrarli
 con i dati ufficiali ANAC (CUP, CPV, aggiudicatario) e salvare tutto in un
-file Excel formattato.
+file Excel formattato. Disponibile sia con interfaccia grafica desktop che
+da riga di comando.
 
 ## Cosa fa il programma
 
-1. Chiede all'utente alcuni filtri di ricerca (parola chiave, CIG, stato gara,
+1. Permette di impostare filtri di ricerca (parola chiave, CIG, stato gara,
    tipologia, scelta del contraente, data di pubblicazione minima).
 2. Naviga tutte le pagine dei risultati del sito della Provincia applicando
    quei filtri.
@@ -32,18 +33,30 @@ file Excel formattato.
 
 ```
 .
-├── main.py            # Interfaccia utente: chiede i filtri e avvia la ricerca
+├── gui.py             # Interfaccia grafica desktop (PyQt6) — modalità consigliata
+├── main.py            # Interfaccia a riga di comando (terminale)
 ├── scraper.py         # Logica di scraping (sito Provincia + API ANAC)
 ├── save_data.py       # Salvataggio dei risultati in Excel
 └── requirements.txt   # Librerie necessarie
 ```
 
+### gui.py
+
+Interfaccia grafica desktop costruita con PyQt6. Presenta una finestra con:
+- Campi di testo per parola chiave oggetto e codice CIG
+- Menu a tendina per stato gara, tipologia e scelta del contraente
+- Sezione filtro data con validazione in tempo reale
+- Sezione impostazioni di esportazione (nome file e cartella di destinazione)
+- Pulsante "Avvia Ricerca" che diventa "Interrompi Ricerca" durante l'esecuzione
+- Barra di avanzamento con indicazione del bando in elaborazione
+- Messaggio finale con esito dell'operazione
+
 ### main.py
 
-Contiene il menu interattivo (selezione filtri con le freccette tramite la
-libreria `pick`), le mappe di traduzione tra le opzioni leggibili e i codici
-richiesti dal sito, e la funzione `avvia_ricerca_bandi` che coordina tutto
-il processo.
+Versione a riga di comando. Contiene il menu interattivo (selezione filtri
+con le freccette tramite la libreria `pick`), le mappe di traduzione tra le
+opzioni leggibili e i codici richiesti dal sito, e la funzione
+`avvia_ricerca_bandi` che coordina tutto il processo.
 
 ### scraper.py
 
@@ -76,7 +89,29 @@ pip install -r requirements.txt
 
 ## Utilizzo
 
-Avvia il programma con:
+### Interfaccia grafica (consigliata)
+
+Avvia l'interfaccia grafica con:
+
+```bash
+python gui.py
+```
+
+Si aprirà una finestra desktop in cui:
+
+1. Compila i filtri desiderati (tutti opzionali)
+2. Imposta eventualmente un filtro sulla data minima di pubblicazione
+3. Inserisci il nome del file Excel e scegli la cartella di destinazione
+4. Premi **Avvia Ricerca**
+
+Durante l'elaborazione la barra di avanzamento mostra il progresso bando per
+bando. È possibile interrompere la ricerca in qualsiasi momento premendo il
+pulsante **Interrompi Ricerca**. Al termine viene mostrato un messaggio con
+l'esito dell'operazione.
+
+### Riga di comando
+
+Avvia la versione testuale con:
 
 ```bash
 python main.py
@@ -92,42 +127,15 @@ Il programma chiederà in sequenza:
 5. Il nome da dare al file Excel risultante (opzionale, altrimenti viene
    generato automaticamente con data e ora)
 
-A questo punto il programma cerca i bandi corrispondenti, mostra a console
-l'avanzamento bando per bando (inclusi i dati ANAC recuperati per ogni CIG)
-e, al termine, salva tutto in un file `.xlsx` nella cartella del progetto.
-
-### Esempio di avvio
-
-```
-=========================================
-        SCRAPER PROVINCIA PISTOIA        
-=========================================
-Compila i campi di testo o premi INVIO per saltarli.
-
-Inserisci parola chiave OGGETTO: 
-Inserisci codice CIG specifico: 
--> Stato Gara selezionato: Aggiudicata
--> Tipologia Gara selezionato: Appalto Di Lavori
--> Scelta Del Contraente selezionato: Procedura Negoziata Art. 50 D. Lgs. 36/2023
-
-Vuoi filtrare i bandi in base alla data di pubblicazione? (s/n): n
--> Nessun filtro data applicato.
-
-Come vuoi chiamare il file Excel? (premi INVIO per nome automatico): Lista_Bandi_2026
-
-[+] Avvio ricerca sul sito...
-...
-[+] File Excel salvato: Lista_Bandi_2026.xlsx
-```
-
 ## Note
 
 - Il programma applica piccole pause tra le richieste per non sovraccaricare
   i server della Provincia e dell'ANAC.
 - Le chiamate all'API ANAC includono un sistema di retry automatico (fino a
   10 tentativi) poiché i server ANAC sono talvolta lenti o temporaneamente
-  irraggiungibili. Alla fine dell'esecuzione viene mostrato un conteggio dei
-  CIG per cui non è stato possibile recuperare i dati ANAC.
+  irraggiungibili. Al termine viene mostrato un conteggio dei CIG per cui
+  non è stato possibile recuperare i dati ANAC.
 - Se un bando ha più CIG (es. bandi multi-lotto), viene generata una riga
   separata nell'Excel per ciascun CIG, mantenendo invariati i dati comuni
   del bando (tipologia, enti, date).
+- L'interfaccia grafica (`gui.py`) è compatibile con Mac, Windows e Linux.

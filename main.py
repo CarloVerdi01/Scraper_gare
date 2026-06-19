@@ -282,14 +282,4 @@ if __name__ == "__main__":
 
     )
 
-'''
-Vecchio inserimento nome file
-    # Chiedi il nome del file
-    nome_file = input("\nCome vuoi chiamare il file Excel? (premi INVIO per nome automatico): ").strip()
-    if nome_file:
-        if not nome_file.endswith(".xlsx"):
-            nome_file += ".xlsx"
-    else:
-        nome_file = None  # Verrà generato automaticamente con data e ora
-'''
 
