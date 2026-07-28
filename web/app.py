@@ -1,80 +1,76 @@
-#introduco il filtro per partita iva
-from pick import pick  # <--- Libreria super leggera per le freccette
-from scraper import genera_url_con_filtri, estrai_lista_bandi, BASE_URL, estrai_dati_json_anac, scarica_json_anac, estrai_dettagli_bando
-from datetime import datetime
-from save_data import salva_in_excel
+"""
+Interfaccia web per la ricerca dei bandi della Provincia di Pistoia.
+
+AUTONOMA da main.py: tutta la logica di orchestrazione (scraping -> filtro
+operatore -> PDF -> ANAC -> salvataggio) vive qui e chiama direttamente i
+moduli di logica scraper, scraper_pdf e save_data. main.py resta separato,
+usato solo per il debug da terminale; questa web app non lo importa.
+
+Versione SEMPLICE: la ricerca gira in un thread di sfondo (una scansione dura
+minuti e bloccherebbe la pagina), il browser ne interroga lo stato e a fine
+lavoro scarica l'Excel. L'avanzamento in tempo reale e' un passo successivo,
+gia' predisposto: lo stato del job tiene un campo pronto a ospitare il log.
+"""
+import os
+import sys
+import re
 import time
-from scraper_pdf import estrai_dati_pdf_esito, estrai_link_pdf_esito, seleziona_pdf_per_cig, seleziona_lotto_per_cig, risolvi_cig, costruisci_lista_cig, cig_compatibile, invitato_con_piva, normalizza_piva
+import uuid
+import threading
+import requests
+from datetime import datetime
+
+from flask import (Flask, render_template, request, jsonify,
+                   send_from_directory, abort)
+
+# Import diretti dai moduli di LOGICA (mai da main.py).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scraper import (genera_url_con_filtri, estrai_lista_bandi, BASE_URL,
+                     estrai_dati_json_anac, scarica_json_anac, estrai_dettagli_bando,
+                     reimposta_via_anac)
+from scraper_pdf import (estrai_dati_pdf_esito, estrai_link_pdf_esito,
+                         seleziona_pdf_per_cig, seleziona_lotto_per_cig, risolvi_cig,
+                         costruisci_lista_cig, cig_compatibile, invitato_con_piva,
+                         normalizza_piva)
+from save_data import salva_in_excel
 
 
 # =====================================================================
-# DIZIONARI DI TRADUZIONE E VINCOLO (I FILTRI REALI DEL SITO)
+# MAPPE DEI FILTRI (codici del sito della Provincia)
 # =====================================================================
 MAPPA_STATO = {
-    "qualsiasi": "All",
-    "aperta": "AP",
-    "aggiudicata": "AG",
-    "deserta": "DE",
-    "non aggiudicata": "NA",
-    "revocata": "RE",
-    "sospesa": "SO",
-    "chiusa": "CH"
+    "Qualsiasi": "All", "Aperta": "AP", "Aggiudicata": "AG",
+    "Deserta": "DE", "Non Aggiudicata": "NA", "Revocata": "RE",
+    "Sospesa": "SO", "Chiusa": "CH"
 }
 
 MAPPA_TIPOLOGIA = {
-    "qualsiasi": "All",
-    "alienazioni": "159",
-    "asta pubblica": "154",
-    "appalto di forniture": "144",
-    "appalto di lavori": "145",
-    "appalto di servizi": "146",
-    "concessione di lavori": "148",
-    "concessione di servizi": "147",
-    "incarichi professionali": "158"
+    "Qualsiasi": "All", "Alienazioni": "159", "Asta Pubblica": "154",
+    "Appalto di Forniture": "144", "Appalto di Lavori": "145",
+    "Appalto di Servizi": "146", "Concessione di Lavori": "148",
+    "Concessione di Servizi": "147", "Incarichi Professionali": "158"
 }
 
 MAPPA_CONTRAENTE = {
-    "qualsiasi": "All",
-    "procedura aperta": "113",
-    "procedura ristretta": "114",
-    "adesione ad accordo quadro/convenzione": "771",
-    "procedura negoziata art. 50 d. lgs. 36/2023": "899",
-    "procedura negoziata art. 36 d. lgs. 50/2016": "126",
-    "previa manifestazione di interesse": "128",
-    "previa consultazione albo fornitori": "129",
-    "affidamento diretto": "130",
-    "affidamento attraverso mepa": "131",
-    "rdo - richiesta di offerta": "132",
-    "oda - ordine diretto d'acquisto": "133",
-    "trattativa diretta": "134",
-    "procedura negoziata senza previa pubblicazione": "127",
-    "altre procedure": "115",
-    "asta pubblica": "139",
-    "dialogo competitivo": "137",
-    "partenariato per l'innovazione": "138",
-    "procedura competitiva con negoziazione": "135",
-    "project financing": "140",
-    "somma urgenza": "157"
+    "Qualsiasi": "All", "Procedura Aperta": "113", "Procedura Ristretta": "114",
+    "Adesione ad Accordo Quadro/Convenzione": "771",
+    "Procedura Negoziata Art. 50 D. Lgs. 36/2023": "899",
+    "Procedura Negoziata Art. 36 D. Lgs. 50/2016": "126",
+    "Previa Manifestazione di Interesse": "128",
+    "Previa Consultazione Albo Fornitori": "129",
+    "Affidamento Diretto": "130", "Affidamento attraverso MEPA": "131",
+    "RDO - Richiesta di Offerta": "132", "ODA - Ordine Diretto d'Acquisto": "133",
+    "Trattativa Diretta": "134",
+    "Procedura Negoziata senza Previa Pubblicazione": "127",
+    "Altre Procedure": "115", "Asta Pubblica": "139",
+    "Dialogo Competitivo": "137", "Partenariato per l'Innovazione": "138",
+    "Procedura Competitiva con Negoziazione": "135",
+    "Project Financing": "140", "Somma Urgenza": "157"
 }
 
 
 # =====================================================================
-# FUNZIONE DI SELEZIONE CON LE FRECCETTE
-# =====================================================================
-def selezione_filtri(nome_filtro, dizionario_mappa):
-    """
-    Mostra un menu interattivo nativo. L'utente si muove con ↑ e ↓
-    e conferma premendo INVIO.
-    """
-    opzioni_visibili = [chiave.title() for chiave in dizionario_mappa.keys()]
-    titolo_menu = f"\nSeleziona {nome_filtro.upper()} (Usa le freccette ↑ ↓ e premi INVIO):"
-    opzione_scelta, indice = pick(opzioni_visibili, titolo_menu, indicator="=>")
-    print(f"-> {nome_filtro.title()} selezionato: {opzione_scelta}")
-    return opzione_scelta.lower()
-
-
-# =====================================================================
-# HELPER: stampa un operatore (manifestante o invitato) da dict o stringa
+# HELPER DI STAMPA (usati dall'orchestrazione)
 # =====================================================================
 def _stampa_operatore(op, indent="            ", numero=None):
     """Stampa un operatore sia se è un dict {"nome":..,"piva":..,"cf":..} sia se è una stringa."""
@@ -97,94 +93,6 @@ def _stampa_operatore(op, indent="            ", numero=None):
             print(f"{indent}{prefisso}{op['nome']}")
     else:
         print(f"{indent}{prefisso}{op}")
-
-
-
-
-# =====================================================================
-# FUNZIONE DI RICHIESTA DATA COMPATIBILE ED INTERATTIVA
-# =====================================================================
-def _chiedi_data(etichetta, obbligatoria=True):
-    """
-    Chiede una data nel formato gg/mm/aaaa e la restituisce come 'YYYY-MM-DD'.
-    Se obbligatoria=False, l'Invio a vuoto vale come "nessuna data" e torna None.
-    """
-    anno_corrente = datetime.now().year
-    suffisso = "" if obbligatoria else " (INVIO per saltare)"
-    while True:
-        testo = input(f"  {etichetta} [gg/mm/aaaa]{suffisso}: ").strip()
-        if not testo and not obbligatoria:
-            return None
-        try:
-            data = datetime.strptime(testo, '%d/%m/%Y')
-        except ValueError:
-            print("  [-] Formato non valido. Esempio corretto: 15/03/2024\n")
-            continue
-        if data.year < 2010 or data.year > anno_corrente:
-            print(f"  [-] Anno fuori intervallo: deve essere tra il 2010 e il {anno_corrente}.\n")
-            continue
-        return data.strftime('%Y-%m-%d')
-
-
-def richiedi_data_limite():
-    """
-    Chiede all'utente se vuole filtrare per data di pubblicazione.
-
-    Ritorna la coppia (data_inizio, data_fine) in formato 'YYYY-MM-DD', con
-    None dove il filtro non e' stato impostato. La data di fine e' facoltativa:
-    lasciandola vuota si ottiene il comportamento storico "dal giorno X in poi".
-    """
-    risposta = input("\nVuoi filtrare i bandi in base alla data di pubblicazione? (s/n): ").strip().lower()
-    if risposta != 's':
-        print("-> Nessun filtro data applicato.")
-        return None, None
-
-    print("\nIndica il periodo di pubblicazione dei bandi da estrarre:")
-    while True:
-        data_inizio = _chiedi_data("Data di INIZIO", obbligatoria=True)
-        data_fine = _chiedi_data("Data di FINE", obbligatoria=False)
-        # La fine non puo' precedere l'inizio: sarebbe un intervallo vuoto e
-        # la ricerca non restituirebbe alcun bando.
-        if data_fine and data_fine < data_inizio:
-            print("  [-] La data di fine precede quella di inizio: intervallo non valido. Riprova.\n")
-            continue
-        break
-
-    _fmt = lambda d: datetime.strptime(d, '%Y-%m-%d').strftime('%d/%m/%Y')
-    if data_fine:
-        print(f"-> Filtro data applicato: bandi pubblicati dal {_fmt(data_inizio)} al {_fmt(data_fine)}.")
-    else:
-        print(f"-> Filtro data applicato: bandi pubblicati dal {_fmt(data_inizio)} in poi.")
-    return data_inizio, data_fine
-
-
-def richiedi_piva_invitato():
-    """
-    Chiede se filtrare i bandi per un operatore invitato.
-
-    Ritorna il codice inserito (P.IVA o codice fiscale) oppure None. Il
-    confronto a valle e' tollerante su spazi, punti e prefisso "IT", quindi
-    qui basta una validazione minima sulla lunghezza.
-    """
-    risposta = input("\nVuoi cercare i bandi in cui e' stato invitato un operatore specifico? (s/n): ").strip().lower()
-    if risposta != 's':
-        print("-> Nessun filtro sull'operatore invitato.")
-        return None
-
-    while True:
-        codice = input("  Inserisci la P.IVA o il codice fiscale dell'operatore: ").strip()
-        pulito = normalizza_piva(codice)
-        if not pulito:
-            print("  [-] Nessun codice inserito. Riprova.\n")
-            continue
-        # P.IVA: 11 cifre; C.F. di persona fisica: 16 caratteri alfanumerici
-        if len(pulito) not in (11, 16):
-            print(f"  [-] Codice di {len(pulito)} caratteri: una P.IVA ne ha 11, "
-                  f"un codice fiscale 16. Riprova.\n")
-            continue
-        print(f"-> Verranno estratti solo i bandi che hanno {pulito} fra gli INVITATI.")
-        print("   (i PDF vanno comunque letti tutti: la P.IVA non e' un filtro del sito)")
-        return pulito
 
 
 def _stampa_lista_operatori(operatori, dichiarati, etichetta, piva_cercata=None):
@@ -216,9 +124,10 @@ def _stampa_lista_operatori(operatori, dichiarati, etichetta, piva_cercata=None)
 
 
 # =====================================================================
-# METODO DI CONTROLLO E AVVIO RICERCA
+# ORCHESTRAZIONE DELLA RICERCA
+# Spostata qui da main.py: e' il cuore che coordina i moduli di logica.
 # =====================================================================
-def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="qualsiasi", contraente="qualsiasi", data_limite=None, data_fine=None, piva_invitato=None, nome_file=None):
+def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="qualsiasi", contraente="qualsiasi", data_limite=None, data_fine=None, piva_invitato=None, nome_file=None, deve_fermarsi=None, segnala_progresso=None):
     codice_stato = MAPPA_STATO[stato]
     codice_tipologia = MAPPA_TIPOLOGIA[tipologia]
     codice_contraente = MAPPA_CONTRAENTE[contraente]
@@ -226,9 +135,9 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
     filtri_attivi = []
     if parola_chiave: filtri_attivi.append(f"Oggetto/Parola chiave: '{parola_chiave}'")
     if cig: filtri_attivi.append(f"CIG: '{cig}'")
-    if stato != "qualsiasi": filtri_attivi.append(f"Stato: '{stato}' (Codice: {codice_stato})")
-    if tipologia != "qualsiasi": filtri_attivi.append(f"Tipologia: '{tipologia}' (Codice: {codice_tipologia})")
-    if contraente != "qualsiasi": filtri_attivi.append(f"Scelta Contraente: '{contraente}' (Codice: {codice_contraente})")
+    if stato != "Qualsiasi": filtri_attivi.append(f"Stato: '{stato}' (Codice: {codice_stato})")
+    if tipologia != "Qualsiasi": filtri_attivi.append(f"Tipologia: '{tipologia}' (Codice: {codice_tipologia})")
+    if contraente != "Qualsiasi": filtri_attivi.append(f"Scelta Contraente: '{contraente}' (Codice: {codice_contraente})")
     if piva_invitato: filtri_attivi.append(f"Solo bandi con invitato P.IVA/C.F.: '{piva_invitato}'")
     if data_limite and data_fine: filtri_attivi.append(f"Pubblicati dal {data_limite} al {data_fine}")
     elif data_limite: filtri_attivi.append(f"Pubblicati dal: '{data_limite}'")
@@ -259,8 +168,24 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
     # Conteggio dei bandi in cui l'operatore cercato e' stato trovato.
     _trovati_1a = {}
     contatore_falliti = 0
+    # CIG effettivamente interrogati su ANAC: serve a distinguere un guasto del
+    # servizio (falliscono TUTTI) da singole gare non pubblicate (ne fallisce
+    # qualcuna, cosa normale).
+    contatore_anac_tentati = 0
 
     for i, link in enumerate(elenco_link, 1):
+        # Interruzione richiesta dall'utente: si controlla all'inizio di ogni
+        # bando, cosi' lo stop avviene a un punto pulito (mai a meta' di una
+        # chiamata ANAC o di una scrittura). Il bando in corso non viene
+        # ripreso e, per scelta, NON si salva nulla del lavoro parziale.
+        if deve_fermarsi is not None and deve_fermarsi():
+            print(f"\n[!] Ricerca interrotta dall'utente dopo {i - 1} bandi. Nessun file prodotto.")
+            return
+        # Avanzamento: annuncia il bando che si sta elaborando ORA ("bando i di
+        # N"). Si segnala all'inizio, cosi' la barra dice cosa e' in corso: parte
+        # dal primo e arriva all'ultimo mentre lo elabora. In terminale e' inerte.
+        if segnala_progresso is not None:
+            segnala_progresso(i, len(elenco_link))
         if i > 1:
             time.sleep(2)
 
@@ -415,6 +340,7 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                 # (oggi commentato) del loop multi-CIG, cosi' alla riattivazione
                 # di quello i due rami restano gemelli.
                 print(f"    [..] Recupero dati ANAC per CIG {cig_effettivo}...")
+                contatore_anac_tentati += 1
                 json_anac = scarica_json_anac(cig_effettivo)
                 if json_anac:
                     dati_anac = estrai_dati_json_anac(json_anac)
@@ -613,6 +539,7 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                     contatore_falliti += 1
                 else:
                     print(f"    [..] Recupero dati ANAC per CIG {cig_singolo}...")
+                    contatore_anac_tentati += 1
                     json_anac = scarica_json_anac(cig_singolo)
                     if json_anac:
                         dati_anac = estrai_dati_json_anac(json_anac)
@@ -651,52 +578,264 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
         print("=" * 60)
 
     if lista_risultati:
-        #salva_in_excel(lista_risultati, nome_file=nome_file, piva_invitato=piva_invitato)
+        salva_in_excel(lista_risultati, nome_file=nome_file, piva_invitato=piva_invitato)
         print(f"\n[!] CIG senza dati ANAC: {contatore_falliti}")
 
+    # Bilancio ANAC per il chiamante: se sono stati tentati dei CIG e sono
+    # falliti TUTTI, il servizio era verosimilmente irraggiungibile; se ne e'
+    # fallita solo una parte, e' la normale assenza di alcune gare da ANAC.
+    anac_giu = (contatore_anac_tentati > 0 and contatore_falliti >= contatore_anac_tentati)
+    return {
+        "bandi": len(elenco_link),
+        "anac_tentati": contatore_anac_tentati,
+        "anac_falliti": contatore_falliti,
+        "anac_giu": anac_giu,
+    }
+
+
 # =====================================================================
-# INTERFACCIA UTENTE PRINCIPALE
+# WEB APP
 # =====================================================================
-if __name__ == "__main__":
-    print("=========================================")
-    print("        SCRAPER PROVINCIA PISTOIA        ")
-    print("=========================================")
-    print("Compila i campi di testo o premi INVIO per saltarli.\n")
+app = Flask(__name__)
 
-    scelta_oggetto = input("Inserisci parola chiave OGGETTO: ").strip()
-    scelta_cig = input("Inserisci codice CIG specifico: ").strip()
+CARTELLA_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+os.makedirs(CARTELLA_OUTPUT, exist_ok=True)
 
-    scelta_stato = selezione_filtri("Stato Gara", MAPPA_STATO)
-    scelta_tipologia = selezione_filtri("Tipologia Gara", MAPPA_TIPOLOGIA)
-    scelta_contraente = selezione_filtri("Scelta del Contraente", MAPPA_CONTRAENTE)
 
-    scelta_data_limite, scelta_data_fine = richiedi_data_limite()
+def _svuota_output():
+    """
+    Rimuove i file .xlsx dalla cartella output. Chiamata all'avvio di ogni nuova
+    ricerca: l'ultimo file resta disponibile (scaricabile piu' volte) finche'
+    non se ne avvia un'altra, poi viene rimosso per non accumulare file vecchi.
+    Eventuali errori (file aperto, permessi) vengono ignorati: la pulizia e'
+    un'operazione "best effort" che non deve mai bloccare la ricerca.
+    """
+    try:
+        for nome in os.listdir(CARTELLA_OUTPUT):
+            if nome.lower().endswith(".xlsx"):
+                try:
+                    os.remove(os.path.join(CARTELLA_OUTPUT, nome))
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
-    scelta_piva = richiedi_piva_invitato()
+_job = {}
+_lock = threading.Lock()
 
-    caratteri_vietati = {'/', '\\', ':', '*', '?', '"', '<', '>', '|'}
 
-    while True:
-        nome_file = input("\nCome vuoi chiamare il file Excel? (premi INVIO per nome automatico): ").strip()
-        if nome_file:
-            caratteri_trovati = [c for c in nome_file if c in caratteri_vietati]
-            if caratteri_trovati:
-                print(f"Errore: il nome contiene caratteri non validi. Caratteri non consentiti: / \\ : * ? \" < > |. Riprova.")
-                continue
-            if not nome_file.endswith(".xlsx"):
-                nome_file += ".xlsx"
-        else:
-            nome_file = None
-        break
+def anac_raggiungibile(tentativi=3, pausa=2):
+    """
+    Verifica che il servizio ANAC dei CIG risponda DAVVERO, prima di avviare
+    la ricerca.
 
-    avvia_ricerca_bandi(
-        parola_chiave=scelta_oggetto,
-        cig=scelta_cig,
-        stato=scelta_stato,
-        tipologia=scelta_tipologia,
-        contraente=scelta_contraente,
-        data_limite=scelta_data_limite,
-        data_fine=scelta_data_fine,
-        piva_invitato=scelta_piva,
-        nome_file=nome_file
+    Non basta pingare la homepage: la ricerca usa l'endpoint 'consultaCIG'
+    (via diretta o Mosparo), che puo' essere giu' anche quando il sito
+    principale risponde. Quindi si interroga proprio quell'endpoint con un CIG
+    NOTO e sempre presente su ANAC: se torna un risultato, il servizio dei dati
+    funziona; se torna vuoto, e' irraggiungibile.
+
+    Usando un CIG che esiste con certezza, un esito negativo non puo' dipendere
+    dal CIG mancante (caso normale e legittimo) ma solo dal servizio che non
+    risponde: cosi' l'avviso 'ANAC giu'' non scatta a sproposito.
+
+    Fa fino a 'tentativi' prove, uscendo al PRIMO successo: un singolo intoppo
+    di rete non basta a dichiarare ANAC irraggiungibile (meno falsi allarmi),
+    ma quando ANAC risponde subito il controllo finisce in un colpo. Solo se
+    TUTTI i tentativi falliscono il servizio e' considerato giu'.
+    """
+    CIG_TEST = "A040010618"  # CIG reale e stabile (Chiesina Uzzanese, gia' verificato)
+    for n in range(1, tentativi + 1):
+        try:
+            reimposta_via_anac()
+            if scarica_json_anac(CIG_TEST, tentativi=3) is not None:
+                return True
+        except Exception:
+            pass
+        if n < tentativi:
+            time.sleep(pausa)  # breve attesa prima di riprovare
+    return False
+
+
+def _iso(data_it):
+    """gg/mm/aaaa -> aaaa-mm-gg, il formato che l'orchestrazione si aspetta."""
+    try:
+        return datetime.strptime(data_it, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _esegui_ricerca(id_job, filtri):
+    """Gira nel thread di sfondo: chiama l'orchestrazione e registra l'esito."""
+    try:
+        nome_file = filtri.get("nome_file") or \
+            f"bandi_pistoia_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        if not nome_file.lower().endswith(".xlsx"):
+            nome_file += ".xlsx"
+        percorso = os.path.join(CARTELLA_OUTPUT, nome_file)
+
+        # Callback di avanzamento: registra nello stato del job a che bando si
+        # e' arrivati, cosi' il polling del browser puo' disegnare la barra.
+        def _progresso(fatti, totale):
+            with _lock:
+                if id_job in _job:
+                    _job[id_job]["fatti"] = fatti
+                    _job[id_job]["totale"] = totale
+
+        esito = avvia_ricerca_bandi(
+            parola_chiave=filtri.get("parola_chiave", ""),
+            cig=filtri.get("cig", ""),
+            stato=filtri.get("stato", "Qualsiasi"),
+            tipologia=filtri.get("tipologia", "Qualsiasi"),
+            contraente=filtri.get("contraente", "Qualsiasi"),
+            data_limite=filtri.get("data_limite"),
+            data_fine=filtri.get("data_fine"),
+            piva_invitato=filtri.get("piva_invitato"),
+            nome_file=percorso,
+            deve_fermarsi=lambda: _job.get(id_job, {}).get("stop", False),
+            segnala_progresso=_progresso,
+        )
+        # Se l'utente ha interrotto, l'orchestrazione esce senza creare il file:
+        # lo stato diventa "interrotto", non "finito".
+        with _lock:
+            if _job[id_job].get("stop"):
+                _job[id_job].update(stato="interrotto")
+            else:
+                # Avviso se ANAC risultava irraggiungibile (tutti i CIG falliti):
+                # il file c'e' comunque, ma le colonne ANAC saranno vuote.
+                avviso = None
+                if esito and esito.get("anac_giu"):
+                    avviso = ("Il servizio ANAC non era raggiungibile: la tabella "
+                              "e' stata generata, ma le colonne con i dati ANAC "
+                              "(oggetto, CUP, CPV, aggiudicatario) risultano vuote. "
+                              "Riprova piu' tardi per avere i dati completi.")
+                _job[id_job].update(stato="finito", file=nome_file, avviso=avviso)
+    except Exception as e:
+        with _lock:
+            _job[id_job].update(stato="errore", errore=str(e))
+
+
+@app.route("/")
+def home():
+    anno_corrente = datetime.now().year
+    return render_template(
+        "index.html",
+        stati=list(MAPPA_STATO.keys()),
+        tipologie=list(MAPPA_TIPOLOGIA.keys()),
+        contraenti=list(MAPPA_CONTRAENTE.keys()),
+        giorni=[f"{g:02d}" for g in range(1, 32)],
+        mesi=[f"{m:02d}" for m in range(1, 13)],
+        anni=[str(a) for a in range(2010, anno_corrente + 1)],
+        anno_corrente=anno_corrente,
     )
+
+
+@app.route("/avvia", methods=["POST"])
+def avvia():
+    d = request.get_json(force=True)
+    data_inizio = (d.get("data_inizio") or "").strip() or None
+    data_fine = (d.get("data_fine") or "").strip() or None
+
+    # Validazione lato SERVER: quella nel browser si puo' aggirare, quindi i
+    # controlli vanno rifatti qui. Una data non valida (es. 31/02) o un nome
+    # file con caratteri proibiti fermano la richiesta con un messaggio, senza
+    # avviare la ricerca.
+    errori = []
+    if data_inizio:
+        data_inizio = _iso(data_inizio)
+        if data_inizio is None:
+            errori.append("La data di inizio non e' una data valida.")
+    if data_fine:
+        data_fine = _iso(data_fine)
+        if data_fine is None:
+            errori.append("La data di fine non e' una data valida.")
+    if data_inizio and data_fine and data_fine < data_inizio:
+        errori.append("La data di fine precede quella di inizio.")
+
+    nome_file = (d.get("nome_file") or "").strip()
+    vietati = set('/\\:*?"<>|')
+    if nome_file and (set(nome_file) & vietati):
+        trovati = " ".join(sorted(set(nome_file) & vietati))
+        errori.append(f"Il nome del file contiene caratteri non ammessi: {trovati}")
+
+    # P.IVA (11 cifre) o codice fiscale (16 caratteri alfanumerici): stesso
+    # criterio usato altrove nel progetto. Si controlla solo se compilato.
+    piva = (d.get("piva_invitato") or "").strip()
+    if piva:
+        pulito = re.sub(r'[\s.\-/]', '', piva).upper()
+        if pulito.startswith("IT") and len(pulito) > 2:
+            pulito = pulito[2:]
+        if len(pulito) not in (11, 16):
+            errori.append("La P.IVA deve avere 11 cifre, il codice fiscale 16 caratteri.")
+
+    if errori:
+        return jsonify(errore=" ".join(errori)), 400
+
+    filtri = {
+        "parola_chiave": (d.get("parola_chiave") or "").strip(),
+        "cig": (d.get("cig") or "").strip(),
+        "stato": d.get("stato") or "Qualsiasi",
+        "tipologia": d.get("tipologia") or "Qualsiasi",
+        "contraente": d.get("contraente") or "Qualsiasi",
+        "data_limite": data_inizio,
+        "data_fine": data_fine,
+        "piva_invitato": (d.get("piva_invitato") or "").strip() or None,
+        "nome_file": nome_file,
+    }
+
+    # Verifica preventiva: se ANAC non risponde, si avvisa subito senza avviare
+    # la scansione (che durerebbe minuti per poi dare colonne ANAC vuote).
+    # Verifica preventiva ANAC. Se non risponde, NON si blocca: si avvisa
+    # l'utente e lo si lascia decidere. Alla prima richiesta, se ANAC e' giu' e
+    # l'utente non ha ancora confermato, si restituisce l'avviso; se ha
+    # confermato (salta_anac), la ricerca parte comunque, senza dati ANAC.
+    salta_anac = bool(d.get("salta_anac"))
+    if not salta_anac and not anac_raggiungibile():
+        return jsonify(
+            anac_giu=True,
+            avviso=("AVVISO: i server ANAC al momento non sono raggiungibili. "
+                    "Puoi procedere comunque, ma l'estrazione sara' priva dei "
+                    "dati ANAC (oggetto, CUP, CPV, aggiudicatario).")
+        ), 200
+
+    # Nuova ricerca: si svuota la cartella dai file delle ricerche precedenti.
+    # Cosi' l'ultimo file resta scaricabile piu' volte finche' non se ne avvia
+    # un'altra, ma la cartella non accumula file vecchi all'infinito.
+    _svuota_output()
+
+    id_job = uuid.uuid4().hex
+    with _lock:
+        _job[id_job] = {"stato": "in_corso", "file": None, "errore": None,
+                        "stop": False, "senza_anac": salta_anac,
+                        "fatti": 0, "totale": 0}
+    threading.Thread(target=_esegui_ricerca, args=(id_job, filtri), daemon=True).start()
+    return jsonify(id_job=id_job)
+
+
+@app.route("/interrompi/<id_job>", methods=["POST"])
+def interrompi(id_job):
+    # Alza la bandiera di stop: il thread la controlla all'inizio di ogni bando
+    # e esce ordinatamente. Non ferma nulla di colpo.
+    with _lock:
+        if id_job in _job:
+            _job[id_job]["stop"] = True
+            return jsonify(ok=True)
+    return jsonify(ok=False), 404
+
+
+@app.route("/stato/<id_job>")
+def stato(id_job):
+    with _lock:
+        s = _job.get(id_job)
+    if not s:
+        abort(404)
+    return jsonify(s)
+
+
+@app.route("/scarica/<nome>")
+def scarica(nome):
+    return send_from_directory(CARTELLA_OUTPUT, nome, as_attachment=True)
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=False)

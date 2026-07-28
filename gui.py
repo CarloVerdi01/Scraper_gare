@@ -2,16 +2,24 @@ import sys
 import threading
 import time
 import queue
+import re
+import requests
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QProgressBar,
-    QFileDialog, QFrame, QSizePolicy, QLayout
+    QFileDialog, QFrame, QSizePolicy, QLayout, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QColor
+# Import completi per l'orchestrazione condivisa con la web app.
 from scraper import (genera_url_con_filtri, estrai_lista_bandi, BASE_URL,
-                     estrai_dati_json_anac, scarica_json_anac, estrai_dettagli_bando)
+                     estrai_dati_json_anac, scarica_json_anac, estrai_dettagli_bando,
+                     reimposta_via_anac)
+from scraper_pdf import (estrai_dati_pdf_esito, estrai_link_pdf_esito,
+                         seleziona_pdf_per_cig, seleziona_lotto_per_cig, risolvi_cig,
+                         costruisci_lista_cig, cig_compatibile, invitato_con_piva,
+                         normalizza_piva)
 from save_data import salva_in_excel
 
 # =====================================================================
@@ -79,29 +87,63 @@ STILE_APPLICAZIONE = """
         border: 2px solid #155cb4;   /*Il bordo diventa leggermente più spesso quando l'utente scrive*/
         background-color: #ffffff;
     }
-    
+
     /*Stile per i Menu a tendina (Filtri e Date)*/
     QComboBox {
-            border: 1.5px solid #1a73e8;  /*Bordo blu*/
-        border-radius: 6px;
-        padding: 5px 10px;
+        border: 1.5px solid #1a73e8;       /* bordo blu sempre presente */
+        border-radius: 8px;
+        padding: 3px 12px;                   /* padding verticale ridotto: il bordo inferiore non viene tagliato */
         min-height: 22px;
-        background-color: #ffffff;
+        background-color: #ffffff;           /* sfondo bianco (test giallo rimosso) */
+        color: #1c1c1c;
+        selection-background-color: #f2f7fd;
+    }
+    QComboBox:focus {
+        border: 1.5px solid #1a73e8;        /* bordo blu solo quando e' attivo/selezionato */
     }
     QComboBox:hover {
-        border: 1.5px solid #155cb4;   /*Il bordo diventa più scuro al passaggio del mouse*/
+        border: 1.5px solid #1a73e8;
+        background-color: #fbfdff;          /* leggerissimo azzurrino al passaggio del mouse */
     }
-    /*Stile della freccina del menu a tendina*/
+    QComboBox:disabled {
+        border: 1.5px solid #e3e6ea;
+        background-color: #f4f5f7;
+        color: #9aa5b1;
+    }
+    /* Area della freccina rimossa: nessun pulsante a destra, solo il bordo. */
     QComboBox::drop-down {
         border: none;
-        padding-right: 10px;
+        width: 0px;
     }
-    /*Stile della lista che si apre quando clicchi sul menu*/
+    QComboBox::down-arrow {
+        image: none;
+        width: 0px;
+        height: 0px;
+    }
+    /* Lista che si apre: voci spaziate, angoli arrotondati, riga evidenziata */
     QComboBox QAbstractItemView {
-        border: 1px solid #1a73e8;
-        selection-background-color: #1a73e8;        /*Sfondo dell'opzione selezionata (blu)*/
-        selection-color: white;                     /*Testo dell'opzione selezionata (bianco)*/
+        border: 1px solid #d0d7de;
+        border-radius: 8px;
         background-color: #ffffff;
+        outline: none;                      /* toglie il bordo tratteggiato di focus */
+        padding: 4px;
+        selection-background-color: #f2f7fd; /* evidenziazione chiara: e' questa che macOS usa davvero */
+        selection-color: #1a73e8;
+    }
+    QComboBox QAbstractItemView::item {
+        min-height: 28px;
+        padding: 4px 10px;
+        margin: 2px 4px;                    /* stacca la voce dai bordi: l'evidenziazione arrotondata si vede */
+        border-radius: 6px;                 /* angoli morbidi, coerenti col resto della pagina */
+        color: #1c1c1c;
+    }
+    QComboBox QAbstractItemView::item:hover {
+        background-color: #f2f7fd;           /* riga sotto il mouse: azzurro molto chiaro */
+        color: #1c1c1c;
+    }
+    QComboBox QAbstractItemView::item:selected {
+        background-color: #f2f7fd;           /* voce scelta: stesso azzurro chiarissimo */
+        color: #1a73e8;                      /* testo blu su sfondo chiaro: ben leggibile */
     }
     /*Caselle di spunta (Checkbox data)*/
     QCheckBox {
@@ -145,49 +187,653 @@ STILE_APPLICAZIONE = """
 """
 
 
+# ============================================================
+# MOTORE DI RICERCA — copiato da web/app.py, IDENTICO.
+# Coordina scraping, PDF, ANAC e salvataggio. La GUI e la web app
+# ne condividono la stessa logica; qui viene chiamato con callback
+# che parlano con la coda della finestra (progresso, interruzione).
+# ============================================================
+
+def _stampa_operatore(op, indent="            ", numero=None):
+    """Stampa un operatore sia se è un dict {"nome":..,"piva":..,"cf":..} sia se è una stringa."""
+    prefisso = f"{numero}. " if numero is not None else "* "
+    if isinstance(op, dict):
+        _pv = op.get("piva", "Non presente")
+        _cf = op.get("cf", "Non presente")
+        # Il C.F. si mostra solo quando AGGIUNGE informazione: se coincide con
+        # la P.IVA (etichetta unica "CF/P.IVA") ripeterlo appesantirebbe il log.
+        # Resta invece essenziale per i professionisti persone fisiche, il cui
+        # C.F. e' alfanumerico, e per le imprese con i due codici distinti.
+        _codici = []
+        if _pv != "Non presente":
+            _codici.append(f"P.IVA: {_pv}")
+        if _cf != "Non presente" and _cf != _pv:
+            _codici.append(f"C.F.: {_cf}")
+        if _codici:
+            print(f"{indent}{prefisso}{op['nome']} ({', '.join(_codici)})")
+        else:
+            print(f"{indent}{prefisso}{op['nome']}")
+    else:
+        print(f"{indent}{prefisso}{op}")
+
+
+def _stampa_lista_operatori(operatori, dichiarati, etichetta, piva_cercata=None):
+    """
+    Stampa una lista di operatori (manifestanti o invitati).
+
+    Quando e' attiva la ricerca per operatore, elencare tutti gli invitati
+    seppellirebbe l'unica riga che interessa sotto centinaia di nomi (i bandi
+    piu' grandi ne hanno oltre 300): si stampa allora il solo operatore
+    cercato, indicando comunque quanti erano in totale. La lista COMPLETA
+    resta nei dati e finira' regolarmente nel salvataggio: qui cambia solo
+    cio' che si vede a schermo.
+    """
+    print(f"        -> [PDF] {etichetta}: {dichiarati}")
+    if not piva_cercata:
+        for j, op in enumerate(operatori or [], 1):
+            _stampa_operatore(op, numero=j)
+        return
+    cercata = normalizza_piva(piva_cercata)
+    trovati = [op for op in (operatori or [])
+               if isinstance(op, dict)
+               and cercata in (normalizza_piva(op.get("piva")), normalizza_piva(op.get("cf")))]
+    for op in trovati:
+        _stampa_operatore(op)
+    if not trovati:
+        print(f"            (operatore cercato non presente in questa lista)")
+    elif len(operatori or []) > len(trovati):
+        print(f"            ... e altri {len(operatori) - len(trovati)} operatori non mostrati")
+
+
+def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="qualsiasi", contraente="qualsiasi",
+                        data_limite=None, data_fine=None, piva_invitato=None, nome_file=None, deve_fermarsi=None,
+                        segnala_progresso=None):
+    codice_stato = MAPPA_STATO[stato]
+    codice_tipologia = MAPPA_TIPOLOGIA[tipologia]
+    codice_contraente = MAPPA_CONTRAENTE[contraente]
+
+    filtri_attivi = []
+    if parola_chiave: filtri_attivi.append(f"Oggetto/Parola chiave: '{parola_chiave}'")
+    if cig: filtri_attivi.append(f"CIG: '{cig}'")
+    if stato != "Qualsiasi": filtri_attivi.append(f"Stato: '{stato}' (Codice: {codice_stato})")
+    if tipologia != "Qualsiasi": filtri_attivi.append(f"Tipologia: '{tipologia}' (Codice: {codice_tipologia})")
+    if contraente != "Qualsiasi": filtri_attivi.append(
+        f"Scelta Contraente: '{contraente}' (Codice: {codice_contraente})")
+    if piva_invitato: filtri_attivi.append(f"Solo bandi con invitato P.IVA/C.F.: '{piva_invitato}'")
+    if data_limite and data_fine:
+        filtri_attivi.append(f"Pubblicati dal {data_limite} al {data_fine}")
+    elif data_limite:
+        filtri_attivi.append(f"Pubblicati dal: '{data_limite}'")
+    elif data_fine:
+        filtri_attivi.append(f"Pubblicati fino al: '{data_fine}'")
+
+    print("\n[+] Avvio ricerca sul sito...")
+    if filtri_attivi:
+        print("  Filtri applicati:")
+        for f in filtri_attivi: print(f"    -> {f}")
+    else:
+        print("  Nessun filtro specifico inserito (mostro tutti i bandi)")
+
+    url_ricerca = genera_url_con_filtri(
+        parola_chiave=parola_chiave, cig=cig, stato=codice_stato,
+        tipologia=codice_tipologia, contraente=codice_contraente
+    )
+
+    elenco_link = estrai_lista_bandi(url_ricerca, data_limite=data_limite, data_fine=data_fine)
+
+    print(f"\n[+] Trovati {len(elenco_link)} bandi corrispondenti ai filtri e alle date.")
+    print("[+] Avvio estrazione dettagli dalle singole pagine...\n")
+
+    lista_risultati = []
+    # Grafie sotto cui l'operatore cercato e' gia' stato visto CON il suo
+    # codice: si costruiscono man mano, dai PDF letti durante questa stessa
+    # scansione. Servono a riconoscerlo anche nei bandi che elencano gli
+    # invitati senza alcun identificativo.
+    # Conteggio dei bandi in cui l'operatore cercato e' stato trovato.
+    _trovati_1a = {}
+    contatore_falliti = 0
+    # CIG effettivamente interrogati su ANAC: serve a distinguere un guasto del
+    # servizio (falliscono TUTTI) da singole gare non pubblicate (ne fallisce
+    # qualcuna, cosa normale).
+    contatore_anac_tentati = 0
+
+    for i, link in enumerate(elenco_link, 1):
+        # Interruzione richiesta dall'utente: si controlla all'inizio di ogni
+        # bando, cosi' lo stop avviene a un punto pulito (mai a meta' di una
+        # chiamata ANAC o di una scrittura). Il bando in corso non viene
+        # ripreso e, per scelta, NON si salva nulla del lavoro parziale.
+        if deve_fermarsi is not None and deve_fermarsi():
+            print(f"\n[!] Ricerca interrotta dall'utente dopo {i - 1} bandi. Nessun file prodotto.")
+            return
+        # Avanzamento: annuncia il bando che si sta elaborando ORA ("bando i di
+        # N"). Si segnala all'inizio, cosi' la barra dice cosa e' in corso: parte
+        # dal primo e arriva all'ultimo mentre lo elabora. In terminale e' inerte.
+        if segnala_progresso is not None:
+            segnala_progresso(i, len(elenco_link))
+        if i > 1:
+            time.sleep(2)
+
+        url_completo = f"{BASE_URL}{link}" if not link.startswith("http") else link
+        print(f"[{i}] Analizzo: {url_completo}")
+
+        dati_bando = estrai_dettagli_bando(url_completo)
+
+        print(f"    -> Tipologia Gara: {dati_bando['tipologia']}")
+        print(f"    -> Scelta Contraente: {dati_bando['scelta_contraente']}")
+        print(f"    -> Ente/Comune: {dati_bando['enti']}")
+        print(f"    -> Pubblicato il: {dati_bando['data_pubblicazione']}")
+        print(f"    -> Scadenza Manif. Interesse: {dati_bando['scadenza_manifestazione']}")
+        print(f"    -> Scadenza Gara: {dati_bando['data_scadenza']}")
+
+        lista_cig = dati_bando.get("cig_list", [])
+        # Alfabeto italiano completo (21 lettere, senza J K W X Y) — fix bando con 13 CIG (IndexError)
+        lettere_lotti = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'L', 'M', 'N',
+                         'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'Z']
+
+        print(f"    [..] Ricerca PDF esito...")
+        lista_pdf = estrai_link_pdf_esito(url_completo)
+        dati_pdf_comuni = None
+
+        # — FILTRO PER P.IVA DELL'INVITATO —
+        # La P.IVA degli invitati esiste SOLO dentro i PDF: non e' un filtro
+        # del sito ne' un dato ANAC, quindi i PDF vanno comunque scaricati e
+        # letti. Il controllo si fa pero' QUI, prima di stampare e soprattutto
+        # prima di interrogare ANAC: per i bandi che non interessano si
+        # risparmiano tutte le chiamate al servizio (con la verifica Mosparo
+        # attiva sono cinque richieste HTTP per ogni CIG).
+        if piva_invitato:
+            _match = None
+            _motivo = None
+            _cache_filtro = {}
+            for _p in (lista_pdf or []):
+                try:
+                    _cache_filtro[_p] = estrai_dati_pdf_esito(_p)
+                except Exception:
+                    continue
+                _match = invitato_con_piva(_cache_filtro[_p], piva_invitato)
+                if _match:
+                    _motivo = "piva"
+                    break
+            if not _match:
+                # Nessun ripiego sul nome: si riconosce l'operatore SOLO dal suo
+                # codice. La ragione sociale non e' un identificativo affidabile
+                # (esistono imprese diverse con lo stesso nome, es. "S2R" o
+                # "BANCHELLI REMO" che in archivio hanno due P.IVA distinte), e
+                # dedurre l'associazione nome->P.IVA significherebbe affermare
+                # qualcosa che il documento non dice. Meglio perdere i bandi che
+                # non dichiarano il codice — una riga mancante e' visibile e
+                # onesta, una riga sbagliata no.
+                print(f"    [~] Operatore {piva_invitato} non presente fra gli invitati: bando saltato.\n")
+                continue
+            _trovati_1a["piva"] = _trovati_1a.get("piva", 0) + 1
+            print(f"    [+] TROVATO fra gli invitati: {_match['nome']}"
+                  f" (P.IVA: {_match.get('piva', 'Non presente')}"
+                  + (f", C.F.: {_match['cf']}" if _match.get('cf', 'Non presente') not in
+                                                  ('Non presente', _match.get('piva')) else "") + ")")
+
+        if lista_pdf:
+            print(f"    [+] PDF trovati: {len(lista_pdf)}")
+            for pdf_url in lista_pdf:
+                print(f"        -> {pdf_url}")
+            if len(lista_pdf) == 1:
+                # UN solo PDF: manifestanti/invitati sono davvero comuni alla gara
+                # (anche nei multi-lotto interni, dove i lotti dividono solo le offerte)
+                dati_pdf_comuni = estrai_dati_pdf_esito(lista_pdf[0])
+
+                # Manifestanti comuni (saltati se i lotti hanno i PROPRI:
+                # verranno stampati dentro ogni sezione [CIG: ...])
+                _manif_nei_lotti = any(l.get("num_manifestanti", "Non presente") != "Non presente"
+                                       for l in dati_pdf_comuni.get("lotti", []))
+                if dati_pdf_comuni["num_operatori_manifestanti"] != "Non presente" and not _manif_nei_lotti:
+                    _stampa_lista_operatori(dati_pdf_comuni["operatori_manifestanti"],
+                                            dati_pdf_comuni['num_operatori_manifestanti'],
+                                            "Operatori manifestanti", piva_invitato)
+
+                # Invitati comuni (saltati se propagati ai lotti: verranno
+                # stampati dentro ogni sezione [CIG: ...], senza duplicare)
+                _inv_nei_lotti = any(l.get("num_invitati", "Non presente") != "Non presente"
+                                     for l in dati_pdf_comuni.get("lotti", []))
+                if dati_pdf_comuni["num_operatori_invitati"] != "Non presente" and not _inv_nei_lotti:
+                    _stampa_lista_operatori(dati_pdf_comuni["operatori_invitati"],
+                                            dati_pdf_comuni['num_operatori_invitati'],
+                                            "Operatori invitati", piva_invitato)
+            else:
+                # PIU' PDF (un PDF per lotto): ogni PDF ha i SUOI manifestanti e
+                # invitati (es. gara SP17/SP24: 134 nel Lotto A, 136 nel Lotto B),
+                # quindi niente blocco comune: si stampano dentro ogni sezione
+                # [CIG: ...] dal PDF agganciato a quel CIG. Si evita anche
+                # un'estrazione doppia del primo PDF (ci pensa la cache del loop).
+                print(f"        -> Manifestanti, invitati e offerte stampati per lotto (un PDF per lotto)")
+        else:
+            print(f"    -> Nessun PDF esito trovato.")
+
+        if not lista_cig:
+            print("    -> CIG: Non trovato")
+            dati_pdf = {}
+            if lista_pdf:
+                dati_pdf = estrai_dati_pdf_esito(lista_pdf[0], lotto_corrente=None)
+                # Il CIG puo' mancare in pagina ma esserci nel PDF: stamparlo qui
+                # lo recupera comunque (utile per identificare la gara)
+                print(f"        -> [PDF] CIG dichiarato nel PDF: {dati_pdf.get('cig_pdf', 'Non presente')}")
+                for lotto in dati_pdf["lotti"]:
+                    # Etichetta del lotto: senza questa, con piu' lotti i blocchi
+                    # stampati di seguito non erano attribuibili (Esito-205/208,
+                    # 9 lotti, gara senza alcun CIG ne' in pagina ne' nel PDF).
+                    if lotto.get("nome_lotto"):
+                        print(f"        -> [PDF] {lotto['nome_lotto']}:")
+                    if lotto.get("cig_lotto", "Non presente") != "Non presente":
+                        print(f"        -> [PDF] CIG del lotto: {lotto['cig_lotto']}")
+
+                    # Manifestanti e invitati PER LOTTO: il ramo senza CIG non li
+                    # stampava affatto (li stampava solo il ramo con CIG, riga ~392),
+                    # per cui nei multi-lotto sembravano mancanti pur essendo estratti.
+                    if lotto.get("num_manifestanti", "Non presente") != "Non presente":
+                        _stampa_lista_operatori(lotto.get("manifestanti", []), lotto['num_manifestanti'],
+                                                "Manifestanti", piva_invitato)
+
+                    if lotto.get("num_invitati", "Non presente") != "Non presente":
+                        _stampa_lista_operatori(lotto.get("invitati", []), lotto['num_invitati'],
+                                                "Invitati", piva_invitato)
+
+                    if lotto["num_offerte_ricevute"] != "Non presente":
+                        print(f"        -> [PDF] Offerte ricevute: {lotto['num_offerte_ricevute']}")
+                        for j, o in enumerate(lotto["offerte_ricevute"], 1):
+                            print(f"            {j}. {o}")
+                    if lotto["num_offerte_ammesse"] != "Non presente":
+                        print(f"        -> [PDF] Offerte ammesse: {lotto['num_offerte_ammesse']}")
+                        for j, o in enumerate(lotto.get("offerte_ammesse", []), 1):
+                            print(f"            {j}. {o}")
+                    if lotto["aggiudicatario_pdf"] != "Non presente":
+                        print(f"        -> [PDF] Aggiudicatario: {lotto['aggiudicatario_pdf']}")
+                    if lotto["aggiudicatario_piva"] != "Non presente":
+                        print(f"        -> [PDF] P.IVA: {lotto['aggiudicatario_piva']}")
+                    # C.F. mostrato solo se aggiunge informazione (diverso dalla P.IVA)
+                    if (lotto.get("aggiudicatario_cf", "Non presente") != "Non presente"
+                            and lotto["aggiudicatario_cf"] != lotto.get("aggiudicatario_piva")):
+                        print(f"        -> [PDF] C.F.: {lotto['aggiudicatario_cf']}")
+                    if lotto["ribasso"] != "Non presente":
+                        print(f"        -> [PDF] Ribasso: {lotto['ribasso']}")
+                    if lotto["valore_offerta"] != "Non presente":
+                        print(f"        -> [PDF] Valore offerta: {lotto['valore_offerta']}")
+
+            # Risoluzione del CIG (pagina -> PDF -> "Non trovato"): la logica
+            # sta in scraper_pdf.risolvi_cig, riusabile da qualunque frontend.
+            cig_effettivo = risolvi_cig(None, dati_pdf)
+            dati_anac = {}
+            if cig_effettivo != "Non trovato":
+                print(f"        -> CIG recuperato dal PDF, usato come CIG della gara: {cig_effettivo}")
+                # ANAC con il CIG recuperato dal PDF: stessa struttura del blocco
+                # (oggi commentato) del loop multi-CIG, cosi' alla riattivazione
+                # di quello i due rami restano gemelli.
+                print(f"    [..] Recupero dati ANAC per CIG {cig_effettivo}...")
+                contatore_anac_tentati += 1
+                json_anac = scarica_json_anac(cig_effettivo)
+                if json_anac:
+                    dati_anac = estrai_dati_json_anac(json_anac)
+                    print(f"        -> [ANAC] Numero Gara: {dati_anac['numero_gara']}")
+                    print(f"        -> [ANAC] Oggetto Gara: {dati_anac['oggetto_gara']}")
+                    print(f"        -> [ANAC] CUP: {dati_anac['cup']}")
+                    print(f"        -> [ANAC] CPV: {dati_anac['cod_cpv']} - {dati_anac['descrizione_cpv']}")
+                    print(f"        -> [ANAC] Tipo Scelta Contraente: {dati_anac['tipo_scelta_contraente']}")
+                    print(
+                        f"        -> [ANAC] Aggiudicatario: {dati_anac['aggiudicatario']} (CF: {dati_anac['aggiudicatario_cf']})")
+                else:
+                    print("        -> [ANAC] Impossibile recuperare i dati.")
+                    contatore_falliti += 1
+            lista_risultati.append({
+                "provincia": dati_bando,
+                "anac": dati_anac,
+                "cig_corrente": cig_effettivo,
+                "pdf": dati_pdf
+            })
+        else:
+            print(f"    -> CIG trovati: {len(lista_cig)} -> {', '.join(lista_cig)}")
+
+            # Cache delle estrazioni PDF: con l'aggancio CIG->PDF per contenuto
+            # ogni PDF puo' dover essere letto per capire a quale CIG appartiene;
+            # la cache evita di scaricare/estrarre due volte lo stesso PDF quando
+            # si itera su piu' CIG della stessa gara.
+            _cache_pdf = {}
+
+            # IL PDF COMANDA, LA PAGINA INTEGRA: la lista dei CIG da processare
+            # viene ricostruita dai CIG dichiarati nei PDF (per-lotto o testata),
+            # cosi' TUTTI i lotti escono anche se la pagina espone CIG monchi o
+            # mancanti; la lista di pagina resta il fallback per i PDF muti e i
+            # suoi CIG non riscontrati nei PDF vengono solo segnalati.
+            _cig_pagina = list(lista_cig)
+            lista_cig, _cig_non_riscontrati, _cig_integrati, _cig_scartati, _cig_divergenti = costruisci_lista_cig(
+                _cig_pagina, lista_pdf, cache=_cache_pdf, con_divergenti=True)
+            if lista_cig != _cig_pagina:
+                print(f"    -> CIG effettivi (pagina + PDF): {len(lista_cig)} -> {', '.join(lista_cig)}")
+            for _c in _cig_integrati:
+                print(f"    [+] CIG integrato dal PDF (assente in pagina): {_c}")
+            for _c in _cig_non_riscontrati:
+                print(f"    [!] CIG di pagina non riscontrato nei PDF (possibile refuso o incoerenza): {_c}")
+            for _c in _cig_scartati:
+                print(
+                    f"    [!] CIG di pagina NON VALIDO ({len(_c)} caratteri, nessun PDF lo completa): {_c} — scartato")
+            # Gara mono-lotto con UN solo PDF che dichiara un CIG DIVERSO da
+            # quello di pagina: non e' un lotto in piu' da processare, e'
+            # un'incoerenza fra le due fonti. Si usa quello di pagina (valido
+            # per ANAC) e si segnala l'altro, senza iterare due volte.
+            for _c in _cig_divergenti:
+                print(f"    [!] Il PDF dichiara {_c}, diverso dal CIG di pagina "
+                      f"{', '.join(_cig_pagina) if _cig_pagina else 'assente'}: "
+                      f"si usa quello di pagina (gara mono-lotto)")
+
+            if not lista_cig and lista_pdf:
+                # Tutti i CIG di pagina scartati e nessun CIG dichiarato nei PDF:
+                # il PDF va processato COMUNQUE — lo scarto vale per ANAC (che ha
+                # comunque la guardia sulla lunghezza), NON per l'estrazione dei
+                # dati. "N.A." e' il segnaposto storico del progetto per il CIG
+                # mancante.
+                print("    [!] Nessun CIG valido disponibile: processo comunque il PDF (CIG = N.A., niente ANAC)")
+                lista_cig = ["N.A."]
+
+            for idx, cig_singolo in enumerate(lista_cig):
+                # cig_compatibile: il filtro utente aggancia anche se ha digitato
+                # il CIG troncato visto in pagina (prefisso del CIG pieno)
+                if cig and not cig_compatibile(cig_singolo, cig):
+                    continue
+
+                # Indicizzazione sicura: oltre le lettere disponibili usa l'etichetta numerica ("22", ecc.)
+                if len(lista_cig) > 1:
+                    lotto_corrente = lettere_lotti[idx] if idx < len(lettere_lotti) else str(idx + 1)
+                else:
+                    lotto_corrente = None
+
+                print(f"\n    [CIG: {cig_singolo}]")
+
+                dati_pdf = {}
+                if lista_pdf:
+                    if len(lista_pdf) > 1:
+                        # Aggancio CIG->PDF per CONTENUTO (CIG dichiarato in testata),
+                        # con fallback posizionale: vedi _seleziona_pdf_per_cig.
+                        _sel = seleziona_pdf_per_cig(lista_pdf, idx, cig_singolo, cache=_cache_pdf)
+                        if _sel is not None:
+                            dati_pdf = _sel
+                        else:
+                            # idx oltre i PDF disponibili e nessun CIG dichiarato combacia:
+                            # comportamento precedente (PDF unico indicizzato per lotto)
+                            dati_pdf = estrai_dati_pdf_esito(lista_pdf[0],
+                                                             indice_lotto=idx if len(lista_cig) > 1 else None)
+                    else:
+                        # PDF unico: se il costruttore della lista CIG lo ha gia'
+                        # estratto (cache) e i lotti dichiarano i loro CIG, si riusa
+                        # quell'estrazione completa e l'aggancio al lotto avviene per
+                        # CONTENUTO piu' sotto (niente ri-estrazione, niente indice).
+                        _dati_cache = _cache_pdf.get(lista_pdf[0])
+                        if _dati_cache is not None and any(
+                                l.get("cig_lotto", "Non presente") != "Non presente"
+                                for l in _dati_cache.get("lotti", [])):
+                            dati_pdf = _dati_cache
+                        else:
+                            dati_pdf = estrai_dati_pdf_esito(lista_pdf[0],
+                                                             indice_lotto=idx if len(lista_cig) > 1 else None)
+
+                    # Formato multi_lotto_std: un PDF, piu' lotti ognuno col suo CIG.
+                    # Si restringe al SOLO lotto di questo CIG (aggancio per contenuto
+                    # via cig_lotto, fallback posizionale) cosi' stampa ed Excel
+                    # portano i dati giusti — la logica sta in scraper_pdf.
+                    _ha_cig_lotto = any(l.get("cig_lotto", "Non presente") != "Non presente"
+                                        for l in dati_pdf.get("lotti", []))
+                    # Restrizione anche SENZA cig_lotto: se il PDF e' unico e i
+                    # suoi lotti sono tanti quanti i CIG di pagina, l'ordine dei
+                    # lotti nel PDF corrisponde a quello dei CIG (Esito_F-2/F-3:
+                    # 2 CIG in pagina, "Lotto 1 campi sportivi - Lotto 2
+                    # palazzetto"). Senza questo ogni CIG stampava TUTTI i lotti,
+                    # duplicando l'intero blocco a ogni giro del ciclo.
+                    _posizionale = (not _ha_cig_lotto
+                                    and len(lista_pdf) == 1
+                                    and len(lista_cig) > 1
+                                    and len(dati_pdf.get("lotti", [])) == len(lista_cig))
+                    if _ha_cig_lotto or _posizionale:
+                        _lotto_sel = seleziona_lotto_per_cig(dati_pdf, cig_singolo, indice_lotto=idx)
+                        if _lotto_sel is not None:
+                            # Il ciclo itera PER CIG e qui si restringe al solo
+                            # lotto di questo CIG. Il conteggio complessivo va
+                            # pero' conservato: senza, il salvataggio vedrebbe
+                            # sempre un solo lotto e classificherebbe come
+                            # "Lotto singolo" anche i bandi multi-lotto.
+                            dati_pdf = {**dati_pdf, "lotti": [_lotto_sel],
+                                        "_totale_lotti": len(dati_pdf.get("lotti", []))}
+
+                    # CIG dichiarato in testata del PDF: stampato PRIMA degli altri
+                    # dati, cosi' e' subito verificabile a occhio l'aggancio CIG->PDF.
+                    # (Nel multi_lotto_std lo sostituisce il CIG del lotto, stampato
+                    # nel blocco del lotto: quello di testata sarebbe sempre il primo.)
+                    _cig_pdf = dati_pdf.get("cig_pdf", "Non presente")
+                    if not _ha_cig_lotto:
+                        print(f"        -> [PDF] CIG dichiarato nel PDF: {_cig_pdf}")
+                    if (len(lista_pdf) > 1 and _cig_pdf != "Non presente"
+                            and _cig_pdf.upper() != cig_singolo.upper()):
+                        # Puo' accadere solo col fallback posizionale: il PDF preso
+                        # per indice dichiara un CIG DIVERSO da quello cercato.
+                        print(f"        [!] ATTENZIONE: il PDF dichiara {_cig_pdf}, "
+                              f"diverso dal CIG cercato {cig_singolo} (aggancio posizionale)")
+
+                    if len(lista_pdf) > 1:
+                        # Un PDF per lotto: manifestanti e invitati appartengono a
+                        # QUESTO lotto e si stampano nella sua sezione [CIG: ...]
+                        if dati_pdf.get("num_operatori_manifestanti", "Non presente") != "Non presente":
+                            _stampa_lista_operatori(dati_pdf["operatori_manifestanti"],
+                                                    dati_pdf['num_operatori_manifestanti'],
+                                                    "Operatori manifestanti", piva_invitato)
+                        if dati_pdf.get("num_operatori_invitati", "Non presente") != "Non presente":
+                            _stampa_lista_operatori(dati_pdf["operatori_invitati"], dati_pdf['num_operatori_invitati'],
+                                                    "Operatori invitati", piva_invitato)
+
+                    for lotto in dati_pdf["lotti"]:
+                        if lotto["nome_lotto"]:
+                            print(f"        -> [PDF] {lotto['nome_lotto']}:")
+                        if lotto.get("cig_lotto", "Non presente") != "Non presente":
+                            print(f"        -> [PDF] CIG del lotto: {lotto['cig_lotto']}")
+
+                        # Manifestanti per lotto
+                        if "num_manifestanti" in lotto and lotto["num_manifestanti"] != "Non presente":
+                            _stampa_lista_operatori(lotto.get("manifestanti", []), lotto["num_manifestanti"],
+                                                    "Manifestanti", piva_invitato)
+
+                        # Invitati per lotto
+                        if "num_invitati" in lotto and lotto["num_invitati"] != "Non presente":
+                            _stampa_lista_operatori(lotto.get("invitati", []), lotto["num_invitati"],
+                                                    "Invitati", piva_invitato)
+
+                        if piva_invitato:
+                            continue
+                        if lotto["num_offerte_ricevute"] != "Non presente":
+                            print(f"        -> [PDF] Offerte ricevute: {lotto['num_offerte_ricevute']}")
+                            for j, o in enumerate(lotto["offerte_ricevute"], 1):
+                                print(f"            {j}. {o}")
+                        if lotto["num_offerte_ammesse"] != "Non presente":
+                            print(f"        -> [PDF] Offerte ammesse: {lotto['num_offerte_ammesse']}")
+                            for j, o in enumerate(lotto.get("offerte_ammesse", []), 1):
+                                print(f"            {j}. {o}")
+                        if lotto["num_offerte_escluse"] != "Non presente":
+                            print(f"        -> [PDF] Offerte escluse: {lotto['num_offerte_escluse']}")
+                        if lotto["aggiudicatario_pdf"] != "Non presente":
+                            print(f"        -> [PDF] Aggiudicatario: {lotto['aggiudicatario_pdf']}")
+                        if lotto["aggiudicatario_piva"] != "Non presente":
+                            print(f"        -> [PDF] P.IVA: {lotto['aggiudicatario_piva']}")
+                        if (lotto.get("aggiudicatario_cf", "Non presente") != "Non presente"
+                                and lotto["aggiudicatario_cf"] != lotto.get("aggiudicatario_piva")):
+                            print(f"        -> [PDF] C.F.: {lotto['aggiudicatario_cf']}")
+                        if lotto["ribasso"] != "Non presente":
+                            print(f"        -> [PDF] Ribasso: {lotto['ribasso']}")
+                        if lotto["valore_offerta"] != "Non presente":
+                            print(f"        -> [PDF] Valore offerta: {lotto['valore_offerta']}")
+
+                # Dati ANAC
+                dati_anac = {}
+                if cig_singolo.upper() == "N.A.":
+                    print(f"    -> CIG non disponibile, dati ANAC non recuperabili.")
+                    contatore_falliti += 1
+                else:
+                    print(f"    [..] Recupero dati ANAC per CIG {cig_singolo}...")
+                    contatore_anac_tentati += 1
+                    json_anac = scarica_json_anac(cig_singolo)
+                    if json_anac:
+                        dati_anac = estrai_dati_json_anac(json_anac)
+                        print(f"        -> [ANAC] Numero Gara: {dati_anac['numero_gara']}")
+                        print(f"        -> [ANAC] Oggetto Gara: {dati_anac['oggetto_gara']}")
+                        print(f"        -> [ANAC] CUP: {dati_anac['cup']}")
+                        print(f"        -> [ANAC] CPV: {dati_anac['cod_cpv']} - {dati_anac['descrizione_cpv']}")
+                        print(f"        -> [ANAC] Tipo Scelta Contraente: {dati_anac['tipo_scelta_contraente']}")
+                        print(
+                            f"        -> [ANAC] Aggiudicatario: {dati_anac['aggiudicatario']} (CF: {dati_anac['aggiudicatario_cf']})")
+                    else:
+                        print("        -> [ANAC] Impossibile recuperare i dati.")
+                        contatore_falliti += 1
+
+                lista_risultati.append({
+                    "provincia": dati_bando,
+                    "anac": dati_anac,
+                    "cig_corrente": cig_singolo,
+                    "pdf": dati_pdf
+                })
+
+                time.sleep(2)
+
+        print("-" * 60)
+
+    # — RIEPILOGO DELLA RICERCA PER OPERATORE —
+    if piva_invitato:
+        _n_piva = _trovati_1a.get("piva", 0)
+        print("\n" + "=" * 60)
+        print(f"[=] RICERCA OPERATORE {piva_invitato} — RIEPILOGO")
+        print(f"    bandi analizzati     : {len(elenco_link)}")
+        print(f"    TROVATI              : {_n_piva}")
+        print(f"    senza corrispondenza : {len(elenco_link) - _n_piva}")
+        print("    NOTA: il riconoscimento avviene solo sul codice dichiarato nel PDF.")
+        print("          I bandi che elencano gli invitati senza P.IVA ne' C.F. non")
+        print("          possono essere ricondotti a un operatore e restano esclusi.")
+        print("=" * 60)
+
+    if lista_risultati:
+        salva_in_excel(lista_risultati, nome_file=nome_file, piva_invitato=piva_invitato)
+        print(f"\n[!] CIG senza dati ANAC: {contatore_falliti}")
+
+    # Bilancio ANAC per il chiamante: se sono stati tentati dei CIG e sono
+    # falliti TUTTI, il servizio era verosimilmente irraggiungibile; se ne e'
+    # fallita solo una parte, e' la normale assenza di alcune gare da ANAC.
+    anac_giu = (contatore_anac_tentati > 0 and contatore_falliti >= contatore_anac_tentati)
+    return {
+        "bandi": len(elenco_link),
+        "anac_tentati": contatore_anac_tentati,
+        "anac_falliti": contatore_falliti,
+        "anac_giu": anac_giu,
+    }
+
+
+def anac_raggiungibile(tentativi=3, pausa=2):
+    """
+    Verifica che il servizio ANAC dei CIG risponda DAVVERO, prima di avviare
+    la ricerca.
+
+    Non basta pingare la homepage: la ricerca usa l'endpoint 'consultaCIG'
+    (via diretta o Mosparo), che puo' essere giu' anche quando il sito
+    principale risponde. Quindi si interroga proprio quell'endpoint con un CIG
+    NOTO e sempre presente su ANAC: se torna un risultato, il servizio dei dati
+    funziona; se torna vuoto, e' irraggiungibile.
+
+    Usando un CIG che esiste con certezza, un esito negativo non puo' dipendere
+    dal CIG mancante (caso normale e legittimo) ma solo dal servizio che non
+    risponde: cosi' l'avviso 'ANAC giu'' non scatta a sproposito.
+
+    Fa fino a 'tentativi' prove, uscendo al PRIMO successo: un singolo intoppo
+    di rete non basta a dichiarare ANAC irraggiungibile (meno falsi allarmi),
+    ma quando ANAC risponde subito il controllo finisce in un colpo. Solo se
+    TUTTI i tentativi falliscono il servizio e' considerato giu'.
+    """
+    CIG_TEST = "A040010618"  # CIG reale e stabile (Chiesina Uzzanese, gia' verificato)
+    for n in range(1, tentativi + 1):
+        try:
+            reimposta_via_anac()
+            if scarica_json_anac(CIG_TEST, tentativi=3) is not None:
+                return True
+        except Exception:
+            pass
+        if n < tentativi:
+            time.sleep(pausa)  # breve attesa prima di riprovare
+    return False
+
+
 class BandiPistoiaApp(QMainWindow):
     def __init__(self):
-        super().__init__()      #Chiama l'inizializzazione della classe genitore (QMainWindow)
+        super().__init__()  # Chiama l'inizializzazione della classe genitore (QMainWindow)
 
-        self.setWindowTitle("Bandi Provincia di Pistoia")  #Imposta il titolo che appare in alto nella finestra del sistema operativo
+        self.setWindowTitle(
+            "Bandi Provincia di Pistoia")  # Imposta il titolo che appare in alto nella finestra del sistema operativo
 
-        self.resize(760, 720)  #Imposta la dimensione iniziale della finestra all'apertura
+        self.resize(760, 600)  # Dimensione iniziale: piu' bassa, per stare in schermi piccoli.
+        # Altezza minima contenuta: sotto questa soglia compare lo scroll invece
+        # di tagliare la parte bassa (pulsanti, barra).
+        self.setMinimumSize(680, 400)
 
-        self.setStyleSheet(STILE_APPLICAZIONE)   #Applica alla finestra lo stile CSS definito sopra
+        self.setStyleSheet(STILE_APPLICAZIONE)  # Applica alla finestra lo stile CSS definito sopra
 
-        #VARIABILI PER LA GESTIONE DEI THREAD E DEI PROCESSI
-        self._interrompi = threading.Event()    # Evento usato come "bandiera": se alzato (set), dice al thread dello scraper di fermarsi
+        # VARIABILI PER LA GESTIONE DEI THREAD E DEI PROCESSI
+        self._interrompi = threading.Event()  # Evento usato come "bandiera": se alzato (set), dice al thread dello scraper di fermarsi
 
-        self._coda = queue.Queue()      # Coda di messaggi (Queue), serve per passare in sicurezza i dati dal thread dello scraper
-                                        # (che lavora in background) al thread della GUI (che gestisce la grafica).
+        self._coda = queue.Queue()  # Coda di messaggi (Queue), serve per passare in sicurezza i dati dal thread dello scraper
+        # (che lavora in background) al thread della GUI (che gestisce la grafica).
 
-        self._ricerca_in_corso = False      #Variabile booleana per sapere se c'è un'elaborazione attiva in questo momento
+        self._ricerca_in_corso = False  # Variabile booleana per sapere se c'è un'elaborazione attiva in questo momento
 
-        #Crea un Timer. Questo timer scatterà a intervalli regolari (es. ogni 100ms)
-        #e chiamerà la funzione `_controlla_coda` per vedere se lo scraper ha inviato nuovi messaggi
+        # Crea un Timer. Questo timer scatterà a intervalli regolari (es. ogni 100ms)
+        # e chiamerà la funzione `_controlla_coda` per vedere se lo scraper ha inviato nuovi messaggi
         self._timer = QTimer()
         self._timer.timeout.connect(self._controlla_coda)
 
-        #COSTRUZIONE LAYOUT PRINCIPALE
-        centrale = QWidget()            # Crea il widget (contenitore) invisibile che farà da base per tutto
+        # COSTRUZIONE LAYOUT PRINCIPALE
+        centrale = QWidget()  # Crea il widget (contenitore) invisibile che farà da base per tutto
 
         # Imposta la politica di Focus: se l'utente clicca sul bianco (sul contenitore), toglie il focus (il cursore lampeggiante) dai campi di testo.
         centrale.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.setCentralWidget(centrale)
 
-        self._layout = QVBoxLayout(centrale) # Crea un Layout Verticale: impila gli elementi dall'alto verso il basso
+        # STRUTTURA: un contenitore esterno senza margini impila due parti —
+        # l'HEADER istituzionale (bande blu a tutta larghezza, fuori dallo
+        # scroll) e sotto l'AREA SCORREVOLE coi filtri. Cosi' le bande occupano
+        # davvero tutta la larghezza, mentre i filtri conservano i loro margini.
+        contenitore = QWidget()
+        contenitore.setStyleSheet("background-color: #ffffff;")
+        colonna = QVBoxLayout(contenitore)
+        colonna.setContentsMargins(0, 0, 0, 0)
+        colonna.setSpacing(0)
 
-        self._layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize) #Definisce spazio minimo per non far schiacciare i componenti
-        self._layout.setSpacing(12) #Spazio verticale tra i vari blocchi
-        self._layout.setContentsMargins(30, 25, 30, 25)  #Spazio ai bordi
+        # Header a tutta larghezza (creato da _crea_intestazione, aggiunto qui).
+        self._header_layout = colonna
 
-        #IMPLEMENTAZIONE INTERFACCIA
-        #Chiama in sequenza le funzioni che creano i singoli pezzi dell'applicazione
+        # AREA SCORREVOLE: il contenuto (filtri in poi) vive dentro una
+        # QScrollArea. Cosi', se la finestra e' piu' bassa del contenuto, compare
+        # la barra di scorrimento e la parte bassa resta sempre raggiungibile.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)  # il contenuto si allarga in orizzontale con la finestra
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(centrale)
+
+        self._layout = QVBoxLayout(centrale)  # Layout verticale dei filtri (dentro lo scroll)
+
+        self._layout.setSizeConstraint(
+            QLayout.SizeConstraint.SetMinimumSize)  # Definisce spazio minimo per non far schiacciare i componenti
+        self._layout.setSpacing(12)  # Spazio verticale tra i vari blocchi
+        self._layout.setContentsMargins(30, 20, 30, 25)  # Spazio ai bordi (i filtri restano rientrati)
+
+        # IMPLEMENTAZIONE INTERFACCIA
+        # Prima l'header (va nel contenitore esterno, a tutta larghezza), poi i
+        # filtri (vanno nel layout dentro lo scroll).
         self._crea_intestazione()
+        # Aggiunge lo scroll sotto l'header e imposta il contenitore come centrale.
+        colonna.addWidget(scroll)
+        self.setCentralWidget(contenitore)
+
         self._aggiungi_separatore()
         self._crea_filtri()
         self._aggiungi_separatore()
         self._crea_sezione_data()
+        self._aggiungi_separatore()
+        self._crea_sezione_operatore()
         self._aggiungi_separatore()
         self._crea_sezione_salvataggio()
         self._aggiungi_separatore()
@@ -197,47 +843,69 @@ class BandiPistoiaApp(QMainWindow):
         # Aggiunge uno spazio flessibile alla fine per spingere tutto in alto se la finestra è grande
         self._layout.addStretch()
 
-        self.setFocus()     #Assicura che all'avvio nessun campo di testo sia selezionato di default
+        self.setFocus()  # Assicura che all'avvio nessun campo di testo sia selezionato di default
 
-    def _aggiungi_separatore(self): #Funzione per creare linee orizzontali per separare i blocchi
+    def _aggiungi_separatore(self):  # Funzione per creare linee orizzontali per separare i blocchi
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         self._layout.addWidget(sep)
 
-    def _crea_intestazione(self): #Costruisce la parte alta dell'interfaccia: Titolo principale e Sottotitolo
-        #Crea un "Frame" (una scatola invisibile) che conterrà titolo e sottotitolo
+    def _crea_intestazione(
+            self):  # Header istituzionale, coerente con la web app: barra scura + fascia blu con stemma e titoli
+        # Barra ente (sottile, blu scuro) in cima, a tutta larghezza.
+        barra_ente = QLabel("Regione Toscana - Provincia di Pistoia")
+        barra_ente.setStyleSheet(
+            "background-color: #004080; color: #ffffff; font-size: 12px; "
+            "padding: 6px 16px;"
+        )
+        barra_ente.setContentsMargins(0, 0, 0, 0)
+
+        # Fascia intestazione (blu Italia) con stemma e titoli.
+        fascia = QWidget()
+        fascia.setStyleSheet("background-color: #0066CC;")
+        f_lay = QHBoxLayout(fascia)
+        f_lay.setContentsMargins(16, 18, 16, 18)
+        f_lay.setSpacing(14)
+
+        # Stemma segnaposto: cerchio bianco con "PT" (da sostituire con lo stemma
+        # reale quando disponibile).
+        stemma = QLabel("PT")
+        stemma.setFixedSize(48, 48)
+        stemma.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        stemma.setStyleSheet(
+            "background-color: #ffffff; color: #0066CC; border-radius: 24px; "
+            "font-size: 18px; font-weight: bold;"
+        )
+        f_lay.addWidget(stemma)
+
+        # Titolo e sottotitolo, impilati a sinistra dello stemma.
+        testi = QWidget()
+        testi.setStyleSheet("background-color: transparent;")
+        t_lay = QVBoxLayout(testi)
+        t_lay.setContentsMargins(0, 0, 0, 0)
+        t_lay.setSpacing(2)
+
+        titolo = QLabel("Ricerca Bandi di Gara")
+        titolo.setStyleSheet("color: #ffffff; font-size: 22px; font-weight: bold; background: transparent;")
+        sottotitolo = QLabel("Estrazione dati appalti e generazione tabella Excel")
+        sottotitolo.setStyleSheet("color: #eaf2fb; font-size: 13px; background: transparent;")
+        t_lay.addWidget(titolo)
+        t_lay.addWidget(sottotitolo)
+        f_lay.addWidget(testi)
+        f_lay.addStretch()
+
+        # L'header (barra + fascia) va nel contenitore ESTERNO, fuori dallo
+        # scroll: cosi' occupa tutta la larghezza della finestra senza margini
+        # bianchi ai lati. Nessun trucco di margini negativi.
+        self._header_layout.addWidget(barra_ente)
+        self._header_layout.addWidget(fascia)
+
+    def _crea_filtri(self):  # Costruisce la sezione centrale contenente i campi di testo e i menu a tendina
+
+        # creiamo una "scatola" contenitore con layout verticale
         frame = QWidget()
-
-        #Assegna a questa scatola un layout verticale (gli elementi saranno impilati)
         layout = QVBoxLayout(frame)
-        layout.setSpacing(4)            #Spazio di 4 pixel tra titolo e sottotitolo
-        layout.setContentsMargins(0, 0, 0, 5)           #Margine inferiore di 5 pixel
-
-        #Testo per il titolo
-        titolo = QLabel("Bandi Provincia di Pistoia")
-        # Questo sovrascrive il CSS globale solo per questa etichetta (lo fa blu, grande 28px e grassetto)
-        titolo.setStyleSheet("color: #1a73e8; font-size: 28px; font-weight: bold;")
-        titolo.setAlignment(Qt.AlignmentFlag.AlignCenter)  #Centra il testo
-
-        #Sottotitolo
-        sottotitolo = QLabel("Piattaforma Desktop per lo Scraping ed Estrazione Dati ANAC")
-        sottotitolo.setFont(QFont("Helvetica", 12))
-        sottotitolo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sottotitolo.setStyleSheet("color: #7f8c8d;")
-
-        # Inserisce le due etichette dentro il layout della "scatola"
-        layout.addWidget(titolo)
-        layout.addWidget(sottotitolo)
-
-        #prende l'intera scatola (frame) e la aggiunge al layout verticale PRINCIPALE della finestra
-        self._layout.addWidget(frame)
-
-    def _crea_filtri(self):     #Costruisce la sezione centrale contenente i campi di testo e i menu a tendina
-
-        #creiamo una "scatola" contenitore con layout verticale
-        frame = QWidget()
-        layout = QVBoxLayout(frame)
-        layout.setSpacing(8)            # Distanza tra i vari campi di input
+        layout.setSpacing(8)  # Distanza tra i vari campi di input
         layout.setContentsMargins(0, 0, 0, 0)
 
         # Titolo
@@ -249,11 +917,11 @@ class BandiPistoiaApp(QMainWindow):
         # CAMPO OGGETTO
         lbl_ogg = QLabel("Parola chiave oggetto:")
         lbl_ogg.setStyleSheet("font-weight: bold; color: #4e5d6c;")
-        layout.addWidget(lbl_ogg)   #Aggiunge la scritta
-        self.campo_oggetto = QLineEdit()   #Crea la casella in cui l'utente può scrivere
-        self.campo_oggetto.setPlaceholderText("Qualsiasi...")   #Testo grigio di suggerimento che scompare quando scrivi
+        layout.addWidget(lbl_ogg)  # Aggiunge la scritta
+        self.campo_oggetto = QLineEdit()  # Crea la casella in cui l'utente può scrivere
+        self.campo_oggetto.setPlaceholderText("Qualsiasi...")  # Testo grigio di suggerimento che scompare quando scrivi
         self.campo_oggetto.setFixedHeight(35)
-        layout.addWidget(self.campo_oggetto)     # Aggiunge la casella al layout
+        layout.addWidget(self.campo_oggetto)  # Aggiunge la casella al layout
 
         # CAMPO CIG
         lbl_cig = QLabel("Codice CIG specifico:")
@@ -266,19 +934,20 @@ class BandiPistoiaApp(QMainWindow):
 
         # SOTTO-LAYOUT ORIZZONTALE (Per affiancare Stato e Tipologia) li mettiamo accanto invece di uno sopra l'altro
         griglia = QHBoxLayout()
-        griglia.setSpacing(15)  #Spazio orizzontale tra la colonna di sinistra e quella di destra
+        griglia.setSpacing(15)  # Spazio orizzontale tra la colonna di sinistra e quella di destra
 
-        #Colonna di Sinistra: Stato gara
-        col1 = QVBoxLayout()   # Mini-layout verticale per impilare Scritta + Menu a tendina
+        # Colonna di Sinistra: Stato gara
+        col1 = QVBoxLayout()  # Mini-layout verticale per impilare Scritta + Menu a tendina
         col1.setSpacing(4)
         lbl_st = QLabel("Stato gara:")
         lbl_st.setStyleSheet("font-weight: bold; color: #4e5d6c;")
         col1.addWidget(lbl_st)
 
-        self.menu_stato = QComboBox()   # Crea il menu a tendina
-        self.menu_stato.addItems(list(MAPPA_STATO.keys()))   # Lo riempie prendendo le "chiavi" dal dizionario in cima al file
-        self.menu_stato.setFixedHeight(35)
-        col1.addWidget(self.menu_stato)   #Lo aggiunge
+        self.menu_stato = QComboBox()  # Crea il menu a tendina
+        self.menu_stato.addItems(
+            list(MAPPA_STATO.keys()))  # Lo riempie prendendo le "chiavi" dal dizionario in cima al file
+        self.menu_stato.setFixedHeight(38)
+        col1.addWidget(self.menu_stato)  # Lo aggiunge
 
         # Colonna di Destra: Tipologia gara
         col2 = QVBoxLayout()
@@ -289,7 +958,7 @@ class BandiPistoiaApp(QMainWindow):
 
         self.menu_tipologia = QComboBox()
         self.menu_tipologia.addItems(list(MAPPA_TIPOLOGIA.keys()))
-        self.menu_tipologia.setFixedHeight(35)
+        self.menu_tipologia.setFixedHeight(38)
         col2.addWidget(self.menu_tipologia)
 
         # Aggiunge le due colonne alla riga orizzontale
@@ -306,26 +975,29 @@ class BandiPistoiaApp(QMainWindow):
 
         self.menu_contraente = QComboBox()
         self.menu_contraente.addItems(list(MAPPA_CONTRAENTE.keys()))
-        self.menu_contraente.setFixedHeight(35)
+        self.menu_contraente.setFixedHeight(38)
         layout.addWidget(self.menu_contraente)
+        # Piccolo spazio sotto l'ultimo menu, cosi' il suo bordo inferiore non
+        # viene a contatto con il separatore della sezione successiva.
+        layout.addSpacing(4)
 
         # Aggiunge l'intero blocco "Filtri" al layout della finestra principale
         self._layout.addWidget(frame)
 
-    def _crea_sezione_data(self):    #Costruisce la sezione per filtrare i bandi in base alla data di pubblicazione
+    def _crea_sezione_data(self):  # Costruisce la sezione per filtrare i bandi in base alla data di pubblicazione
         # Creiamo il contenitore principale per la sezione data
         frame = QWidget()
         layout = QVBoxLayout(frame)
         layout.setSpacing(8)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        #Titolo
+        # Titolo
         titolo = QLabel("FILTRO DATA DI PUBBLICAZIONE")
         titolo.setFont(QFont("Helvetica", 11, QFont.Weight.Bold))
         titolo.setStyleSheet("color: #1a73e8; letter-spacing: 1px;")
         layout.addWidget(titolo)
 
-        #CheckBox di attivazione
+        # CheckBox di attivazione
         self.checkbox_data = QCheckBox("Attiva limite temporale sui bandi")
         self.checkbox_data.setStyleSheet("font-weight: 500;")
 
@@ -334,7 +1006,7 @@ class BandiPistoiaApp(QMainWindow):
         self.checkbox_data.stateChanged.connect(self._toggle_data)
         layout.addWidget(self.checkbox_data)
 
-        #Riga orizzontale dei menu data
+        # Riga orizzontale dei menu data
         riga_data = QHBoxLayout()
         riga_data.setSpacing(8)
 
@@ -342,41 +1014,72 @@ class BandiPistoiaApp(QMainWindow):
         lbl_dm.setStyleSheet("color: #5c6b73;")
         riga_data.addWidget(lbl_dm)
 
-        anno_corrente = datetime.now().year   # Recupera l'anno attuale dal sistema
+        anno_corrente = datetime.now().year  # Recupera l'anno attuale dal sistema
 
         # MENU GIORNO
         self.menu_giorno = QComboBox()
-        #Crea una lista di numeri da 1 a 31
-        self.menu_giorno.addItems([str(g).zfill(2) for g in range(1, 32)])
-        # Imposta di default il giorno di oggi
-        self.menu_giorno.setCurrentText(str(datetime.now().day).zfill(2))
-        self.menu_giorno.setEnabled(False) # Disabilitato all'avvio (fino a che non si spunta la checkbox)
+        # "--" in testa: il giorno e' opzionale. Da solo o col mese l'anno resta
+        # obbligatorio; i pezzi lasciati a "--" vengono completati automaticamente.
+        self.menu_giorno.addItems(["--"] + [str(g).zfill(2) for g in range(1, 32)])
+        self.menu_giorno.setEnabled(False)  # Disabilitato all'avvio (fino a che non si spunta la checkbox)
         self.menu_giorno.setFixedSize(65, 32)
-        self.menu_giorno.currentTextChanged.connect(self._valida_data) # Se l'utente cambia il giorno, chiama la funzione `_valida_data` per controllare se è corretto
+        self.menu_giorno.currentTextChanged.connect(
+            self._valida_data)  # Se l'utente cambia il giorno, chiama la funzione `_valida_data` per controllare se è corretto
 
         # MENU MESE
         self.menu_mese = QComboBox()
-        self.menu_mese.addItems([str(m).zfill(2) for m in range(1, 13)]) # Mesi da 01 a 12
-        self.menu_mese.setCurrentText(str(datetime.now().month).zfill(2))
+        self.menu_mese.addItems(["--"] + [str(m).zfill(2) for m in range(1, 13)])  # "--" + mesi 01-12
         self.menu_mese.setEnabled(False)
         self.menu_mese.setFixedSize(65, 32)
         self.menu_mese.currentTextChanged.connect(self._valida_data)
 
         # MENU ANNO
         self.menu_anno = QComboBox()
-        # Genera un elenco dal 2010 fino all'anno corrente
-        self.menu_anno.addItems([str(a) for a in range(2010, anno_corrente + 1)])
-        self.menu_anno.setCurrentText(str(anno_corrente))
+        # "--" + elenco dal 2010 fino all'anno corrente
+        self.menu_anno.addItems(["--"] + [str(a) for a in range(2010, anno_corrente + 1)])
         self.menu_anno.setEnabled(False)
         self.menu_anno.setFixedSize(85, 32)
         self.menu_anno.currentTextChanged.connect(self._valida_data)
 
-        #Aggiunge i tre menu alla riga orizzontale
+        # Aggiunge i tre menu alla riga orizzontale
         riga_data.addWidget(self.menu_giorno)
         riga_data.addWidget(self.menu_mese)
         riga_data.addWidget(self.menu_anno)
-        riga_data.addStretch()            # Spinge tutto a sinistra lasciando vuoto lo spazio a destra
+        riga_data.addStretch()  # Spinge tutto a sinistra lasciando vuoto lo spazio a destra
         layout.addLayout(riga_data)
+
+        # Riga DATA FINE: opzionale. Con "--" la data fine non viene impostata e
+        # si estrae fino ai bandi piu' recenti; e' anche possibile impostare solo
+        # la fine lasciando l'inizio, o viceversa.
+        riga_fine = QHBoxLayout()
+        riga_fine.setSpacing(8)
+        lbl_df = QLabel("fino al (opzionale):")
+        lbl_df.setStyleSheet("color: #5c6b73;")
+        riga_fine.addWidget(lbl_df)
+
+        self.menu_giorno_fine = QComboBox()
+        self.menu_giorno_fine.addItems(["--"] + [str(g).zfill(2) for g in range(1, 32)])
+        self.menu_giorno_fine.setEnabled(False)
+        self.menu_giorno_fine.setFixedSize(65, 32)
+        self.menu_giorno_fine.currentTextChanged.connect(self._valida_data)
+
+        self.menu_mese_fine = QComboBox()
+        self.menu_mese_fine.addItems(["--"] + [str(m).zfill(2) for m in range(1, 13)])
+        self.menu_mese_fine.setEnabled(False)
+        self.menu_mese_fine.setFixedSize(65, 32)
+        self.menu_mese_fine.currentTextChanged.connect(self._valida_data)
+
+        self.menu_anno_fine = QComboBox()
+        self.menu_anno_fine.addItems(["--"] + [str(a) for a in range(2010, anno_corrente + 1)])
+        self.menu_anno_fine.setEnabled(False)
+        self.menu_anno_fine.setFixedSize(85, 32)
+        self.menu_anno_fine.currentTextChanged.connect(self._valida_data)
+
+        riga_fine.addWidget(self.menu_giorno_fine)
+        riga_fine.addWidget(self.menu_mese_fine)
+        riga_fine.addWidget(self.menu_anno_fine)
+        riga_fine.addStretch()
+        layout.addLayout(riga_fine)
 
         # MESSAGGIO DI ERRORE DATA
         # Etichetta pronta a mostrare errori se la combinazione di data è errata. All'inizio è vuota (""), quindi invisibile.
@@ -386,8 +1089,79 @@ class BandiPistoiaApp(QMainWindow):
 
         self._layout.addWidget(frame)
 
+    def _crea_sezione_operatore(self):  # Sezione per filtrare i bandi in cui e' stato invitato un operatore
+        frame = QWidget()
+        layout = QVBoxLayout(frame)
+        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-    def _toggle_data(self):    #Attiva o spegne i menu delle date e cambia il loro stile visivo in base alla Checkbox
+        titolo = QLabel("RICERCA PER OPERATORE INVITATO")
+        titolo.setFont(QFont("Helvetica", 11, QFont.Weight.Bold))
+        titolo.setStyleSheet("color: #1a73e8; letter-spacing: 1px;")
+        layout.addWidget(titolo)
+
+        self.checkbox_piva = QCheckBox("Filtra per un operatore specifico (P.IVA o C.F.)")
+        self.checkbox_piva.setStyleSheet("font-weight: 500;")
+        self.checkbox_piva.stateChanged.connect(self._toggle_piva)
+        layout.addWidget(self.checkbox_piva)
+
+        riga = QHBoxLayout()
+        riga.setSpacing(8)
+        lbl = QLabel("P.IVA o C.F. invitato:")
+        lbl.setStyleSheet("color: #5c6b73;")
+        riga.addWidget(lbl)
+
+        self.campo_piva = QLineEdit()
+        self.campo_piva.setPlaceholderText("11 cifre (P.IVA) o 16 caratteri (C.F.)")
+        self.campo_piva.setEnabled(False)
+        # Parte disattivato: bordo neutro. Diventa blu quando si spunta la casella.
+        self.campo_piva.setStyleSheet("QLineEdit { border: 1.5px solid #dcdde1; background-color: #f1f2f6; }")
+        self.campo_piva.setFixedHeight(32)
+        self.campo_piva.textChanged.connect(self._valida_piva)
+        riga.addWidget(self.campo_piva)
+        layout.addLayout(riga)
+
+        # Nota: in tabella finiscono solo i bandi in cui l'operatore e' fra gli invitati.
+        nota = QLabel("Solo i bandi in cui l'operatore compare fra gli invitati.")
+        nota.setStyleSheet("color: #8a9ba8; font-size: 11px;")
+        layout.addWidget(nota)
+
+        self.label_errore_piva = QLabel("")
+        self.label_errore_piva.setStyleSheet("color: #d63031; font-weight: bold; font-size: 12px;")
+        layout.addWidget(self.label_errore_piva)
+
+        self._layout.addWidget(frame)
+
+    def _toggle_piva(self):  # Attiva o spegne il campo P.IVA
+        attivo = self.checkbox_piva.isChecked()
+        self.campo_piva.setEnabled(attivo)
+        if attivo:
+            # Attivo: bordo blu, come una casella di filtro in uso.
+            self.campo_piva.setStyleSheet("QLineEdit { border: 1.5px solid #1a73e8; }")
+        else:
+            # Spento: bordo neutro e sfondo grigino, per segnalare che e' inattivo.
+            self.campo_piva.setStyleSheet("QLineEdit { border: 1.5px solid #dcdde1; background-color: #f1f2f6; }")
+            self.label_errore_piva.setText("")
+        self._valida_piva()
+
+    def _valida_piva(self):  # Verifica lunghezza P.IVA (11) o C.F. (16)
+        if not self.checkbox_piva.isChecked():
+            self.label_errore_piva.setText("")
+            return True
+        testo = self.campo_piva.text().strip()
+        if not testo:
+            self.label_errore_piva.setText("")
+            return True
+        pulito = re.sub(r'[\s.\-/]', '', testo).upper()
+        if pulito.startswith("IT") and len(pulito) > 2:
+            pulito = pulito[2:]
+        if len(pulito) in (11, 16):
+            self.label_errore_piva.setText("")
+            return True
+        self.label_errore_piva.setText("La P.IVA deve avere 11 cifre, il C.F. 16 caratteri.")
+        return False
+
+    def _toggle_data(self):  # Attiva o spegne i menu delle date e cambia il loro stile visivo in base alla Checkbox
         # Controlla se la casella è spuntata (True) o no (False)
         attivo = self.checkbox_data.isChecked()
 
@@ -395,45 +1169,92 @@ class BandiPistoiaApp(QMainWindow):
         self.menu_giorno.setEnabled(attivo)
         self.menu_mese.setEnabled(attivo)
         self.menu_anno.setEnabled(attivo)
+        # Anche i menu della data fine seguono la stessa casella.
+        self.menu_giorno_fine.setEnabled(attivo)
+        self.menu_mese_fine.setEnabled(attivo)
+        self.menu_anno_fine.setEnabled(attivo)
 
-        # Quando disabilitati, togliamo il bordo blu intenso visivamente tramite foglio di stile
-        if attivo:
-            self.menu_giorno.setStyleSheet("")
-            self.menu_mese.setStyleSheet("")
-            self.menu_anno.setStyleSheet("")
-        else:
-            stile_disabilitato = "QComboBox { border: 1px solid #dcdde1; background-color: #f1f2f6; }"
-            self.menu_giorno.setStyleSheet(stile_disabilitato)
-            self.menu_mese.setStyleSheet(stile_disabilitato)
-            self.menu_anno.setStyleSheet(stile_disabilitato)
+        # Lo stato disabilitato ha gia' il suo stile nel foglio globale
+        # (QComboBox:disabled): non serve piu' impostarlo a mano qui, cosi' i
+        # menu data spenti hanno lo stesso aspetto curato di tutti gli altri.
 
-        #controlliamo se la data inserita (anche se appena riattivata) è valida
+        # controlliamo se la data inserita (anche se appena riattivata) è valida
         self._valida_data()
 
-
-
-    def _valida_data(self):     #Verifica che la data selezionata dall'utente esista davvero
+    def _valida_data(self):  # Verifica che la data selezionata dall'utente esista davvero
 
         # Se la spunta non è attiva, non c'è bisogno di validare nulla. Cancelliamo eventuali errori.
         if not self.checkbox_data.isChecked():
             self.label_errore_data.setText("")
             return True
-        try:
-            # datetime.strptime prende una stringa (es. "31/02/2026") e prova a convertirla in una data reale
-            # usando il formato "%d/%m/%Y" (giorno/mese/anno a 4 cifre)
-            datetime.strptime(
-                f"{self.menu_giorno.currentText()}/{self.menu_mese.currentText()}/{self.menu_anno.currentText()}",
-                "%d/%m/%Y"
-            )
-            # Se la conversione riesce, la data esiste. Cancelliamo l'errore.
-            self.label_errore_data.setText("")
-            return True
-        except ValueError:
-            #Se la conversione fallisce mostriamo l'errore con la scritta rossa
-            self.label_errore_data.setText("⚠ Configurazione data non valida.")
+        # Valida entrambe le date (inizio e fine) con le regole di combinazione
+        # e completamento. _componi_data restituisce (iso, errore).
+        _, err_i = self._componi_data("inizio")
+        _, err_f = self._componi_data("fine")
+        if err_i:
+            self.label_errore_data.setText(f"⚠ Data inizio: {err_i}")
             return False
+        if err_f:
+            self.label_errore_data.setText(f"⚠ Data fine: {err_f}")
+            return False
+        # Coerenza intervallo: fine non prima di inizio.
+        iso_i, _ = self._componi_data("inizio")
+        iso_f, _ = self._componi_data("fine")
+        if iso_i and iso_f and iso_f < iso_i:
+            self.label_errore_data.setText("⚠ La data di fine precede quella di inizio.")
+            return False
+        self.label_errore_data.setText("")
+        return True
 
-    def _crea_sezione_salvataggio(self):   #Costruisce i campi relativi alla scelta del nome file e a dove salvare il file Excel di output
+    def _componi_data(self, quale):
+        """
+        Compone una data dai tre menu (giorno/mese/anno) di 'inizio' o 'fine',
+        permettendo di ometterne dei pezzi con "--".
+
+        Combinazioni valide (si compila da sinistra): solo anno, anno+mese,
+        anno+mese+giorno. Mese senza anno o giorno senza mese sono incoerenti.
+        I pezzi mancanti si completano secondo il verso:
+          inizio -> primo istante (01/01 o 01 del mese)
+          fine   -> ultimo istante (31/12 o ultimo giorno reale del mese)
+
+        Restituisce (data_iso "aaaa-mm-gg" o "", errore "" o testo).
+        """
+        import calendar
+        if quale == "inizio":
+            g = self.menu_giorno.currentText()
+            m = self.menu_mese.currentText()
+            a = self.menu_anno.currentText()
+        else:
+            g = self.menu_giorno_fine.currentText()
+            m = self.menu_mese_fine.currentText()
+            a = self.menu_anno_fine.currentText()
+        # "--" equivale a vuoto.
+        g = "" if g == "--" else g
+        m = "" if m == "--" else m
+        a = "" if a == "--" else a
+
+        if not a and not m and not g:
+            return "", ""  # niente impostato
+        if not a and (m or g):
+            return "", "serve almeno l'anno."
+        if a and not m and g:
+            return "", "con il giorno indica anche il mese."
+
+        anno = int(a)
+        mese = int(m) if m else (12 if quale == "fine" else 1)
+        if g:
+            giorno = int(g)
+        else:
+            giorno = calendar.monthrange(anno, mese)[1] if quale == "fine" else 1
+        # Verifica che la data esista (es. 31/02 non valido).
+        try:
+            datetime(anno, mese, giorno)
+        except ValueError:
+            return "", "data non valida (controlla il giorno)."
+        return f"{anno:04d}-{mese:02d}-{giorno:02d}", ""
+
+    def _crea_sezione_salvataggio(
+            self):  # Costruisce i campi relativi alla scelta del nome file e a dove salvare il file Excel di output
         # Scatola contenitore con layout verticale per questa sezione
         frame = QWidget()
         layout = QVBoxLayout(frame)
@@ -451,25 +1272,25 @@ class BandiPistoiaApp(QMainWindow):
         lbl_nf.setStyleSheet("font-weight: bold; color: #4e5d6c;")
         layout.addWidget(lbl_nf)
 
-        #Campo di testo in cui l'utente può digitare il nome dell'Excel
+        # Campo di testo in cui l'utente può digitare il nome dell'Excel
         self.campo_nome_file = QLineEdit()
         self.campo_nome_file.setPlaceholderText("Lascia vuoto per generazione automatica")
         self.campo_nome_file.setFixedHeight(35)
 
-        #Ogni volta che il testo nella casella cambia viene attivato il controllo tramite la funzione _valida_nome_file
+        # Ogni volta che il testo nella casella cambia viene attivato il controllo tramite la funzione _valida_nome_file
         self.campo_nome_file.textChanged.connect(self._valida_nome_file)
         layout.addWidget(self.campo_nome_file)
 
-        #Etichetta di errore dedicata ai simboli vietati (inizialmente vuota)
+        # Etichetta di errore dedicata ai simboli vietati (inizialmente vuota)
         self.label_errore_nome = QLabel("")
         self.label_errore_nome.setStyleSheet("color: #d63031; font-weight: bold; font-size: 12px;")
         layout.addWidget(self.label_errore_nome)
 
-        #Riga orizzontale per la sezione dell cartella
+        # Riga orizzontale per la sezione dell cartella
         riga_cartella = QHBoxLayout()
         riga_cartella.setSpacing(10)
 
-        #mostra il percorso scelto
+        # mostra il percorso scelto
         lbl_dest = QLabel("Destinazione:")
         lbl_dest.setStyleSheet("font-weight: bold; color: #4e5d6c;")
         riga_cartella.addWidget(lbl_dest)
@@ -496,7 +1317,8 @@ class BandiPistoiaApp(QMainWindow):
                 border: 1px solid #b2bec3;
             }
         """)
-        self.pulsante_sfoglia.clicked.connect(self._scegli_cartella)  # Quando viene cliccato, si apre la finestra nativa di scelta cartella
+        self.pulsante_sfoglia.clicked.connect(
+            self._scegli_cartella)  # Quando viene cliccato, si apre la finestra nativa di scelta cartella
         riga_cartella.addWidget(self.pulsante_sfoglia)
 
         # Aggiungiamo la riga orizzontale della cartella al layout principale di questa sezione
@@ -504,30 +1326,32 @@ class BandiPistoiaApp(QMainWindow):
 
         self._layout.addWidget(frame)
 
-    def _scegli_cartella(self):         #Apre la finestra per selezionare interattivamente la cartella di destinazione
-        cartella = QFileDialog.getExistingDirectory(self, "Scegli cartella di destinazione")  #apre la finestra standard per scegliere una cartella, restituisce una stringa con il percorso
+    def _scegli_cartella(self):  # Apre la finestra per selezionare interattivamente la cartella di destinazione
+        cartella = QFileDialog.getExistingDirectory(self,
+                                                    "Scegli cartella di destinazione")  # apre la finestra standard per scegliere una cartella, restituisce una stringa con il percorso
         # Se è stata scelta una cartella (la stringa non è vuota)
         if cartella:
             self.label_cartella.setText(cartella)  # Aggiorna il testo dell'etichetta mostrando il percorso reale
             self.label_cartella.setStyleSheet("color: #2c3e50; font-style: normal; font-weight: 500;")
 
-    def _valida_nome_file(self):            #Verifica l'uso di caratteri vietati nel nome del file
-        nome = self.campo_nome_file.text().strip()  #Prende il testo digitato
-        caratteri_vietati = {'/', '\\', ':', '*', '?', '"', '<', '>', '|'}   #Set di caratteri vietati
-        trovati = [c for c in nome if c in caratteri_vietati]  #lista contenente solo i caratteri vietati inseriti
-        if trovati:   ## Se la lista "trovati" contiene qualcosa, c'è un errore
-            self.label_errore_nome.setText("⚠ Il nome contiene simboli non validi per i file di sistema.") #appare scritta di errore
+    def _valida_nome_file(self):  # Verifica l'uso di caratteri vietati nel nome del file
+        nome = self.campo_nome_file.text().strip()  # Prende il testo digitato
+        caratteri_vietati = {'/', '\\', ':', '*', '?', '"', '<', '>', '|'}  # Set di caratteri vietati
+        trovati = [c for c in nome if c in caratteri_vietati]  # lista contenente solo i caratteri vietati inseriti
+        if trovati:  ## Se la lista "trovati" contiene qualcosa, c'è un errore
+            self.label_errore_nome.setText(
+                "⚠ Il nome contiene simboli non validi per i file di sistema.")  # appare scritta di errore
             return False
-        self.label_errore_nome.setText("")  #se non ci sono caratteri vietati cancella il testo e dà il via libera
+        self.label_errore_nome.setText("")  # se non ci sono caratteri vietati cancella il testo e dà il via libera
         return True
 
-    def _crea_pulsanti(self):    #Costruisce i due pulsanti (Reset e Avvia) in fondo
+    def _crea_pulsanti(self):  # Costruisce i due pulsanti (Reset e Avvia) in fondo
         frame = QWidget()
         layout = QHBoxLayout(frame)
         layout.setSpacing(15)
         layout.setContentsMargins(0, 5, 0, 0)
 
-        #Pulsante di reset
+        # Pulsante di reset
         self.pulsante_reset = QPushButton("Reset Filtri")
         self.pulsante_reset.setFixedWidth(140)
         self.pulsante_reset.setFixedHeight(45)
@@ -546,9 +1370,9 @@ class BandiPistoiaApp(QMainWindow):
                 border: 1px solid #c0392b;
             }
         """)
-        self.pulsante_reset.clicked.connect(self._reset_filtri) #con il click esegue funzione '_reset_filtri'
+        self.pulsante_reset.clicked.connect(self._reset_filtri)  # con il click esegue funzione '_reset_filtri'
 
-        #Pulsante avvia ricerca
+        # Pulsante avvia ricerca
         self.pulsante_ricerca = QPushButton("🔍  Avvia Ricerca")
         self.pulsante_ricerca.setFixedHeight(45)
         self.pulsante_ricerca.setStyleSheet("""
@@ -564,21 +1388,22 @@ class BandiPistoiaApp(QMainWindow):
                 background-color: #155cb4;
             }
         """)
-        self.pulsante_ricerca.clicked.connect(self._gestisci_pulsante)  #con il click esgue il metodo '_gestisci_pulsante'
+        self.pulsante_ricerca.clicked.connect(
+            self._gestisci_pulsante)  # con il click esgue il metodo '_gestisci_pulsante'
 
         # Li aggiungiamo al layout orizzontale (Reset a sinistra, Ricerca a destra)
         layout.addWidget(self.pulsante_reset)
         layout.addWidget(self.pulsante_ricerca)
 
-        #Aggiunge il layout alla finestra
+        # Aggiunge il layout alla finestra
         self._layout.addWidget(frame)
 
-    def _reset_filtri(self):       #Ripristina tutti i campi dell'interfaccia allo stato iniziale
-        #Se c'è una ricerca in corso blocca il reset
+    def _reset_filtri(self):  # Ripristina tutti i campi dell'interfaccia allo stato iniziale
+        # Se c'è una ricerca in corso blocca il reset
         if self._ricerca_in_corso:
             return
 
-        #ripristina tutti i campi
+        # ripristina tutti i campi
         self.campo_oggetto.clear()
         self.campo_cig.clear()
         self.campo_nome_file.clear()
@@ -588,41 +1413,52 @@ class BandiPistoiaApp(QMainWindow):
         self.menu_tipologia.setCurrentIndex(0)
         self.menu_contraente.setCurrentIndex(0)
         self.checkbox_data.setChecked(False)
+        # Azzera anche i campi nuovi.
+        self.checkbox_piva.setChecked(False)
+        self.campo_piva.clear()
+        self.menu_giorno_fine.setCurrentIndex(0)  # "--"
+        self.menu_mese_fine.setCurrentIndex(0)
+        self.menu_anno_fine.setCurrentIndex(0)
         self.etichetta_finale.setText("")
         self.etichetta_finale.hide()
 
-    def _gestisci_pulsante(self):     #Metodo di controllo, gestisce se avviare la ricerca o interromperla in base allo stato attuale
+    def _gestisci_pulsante(
+            self):  # Metodo di controllo, gestisce se avviare la ricerca o interromperla in base allo stato attuale
 
-        #Se la ricerca è già attiva allora il click è avvenuto su interrompi
+        # Se la ricerca è già attiva allora il click è avvenuto su interrompi
         if self._ricerca_in_corso:
-            self._interrompi.set()    #interrompe il thread
+            self._interrompi.set()  # interrompe il thread
             self.etichetta_stato.setText("Interruzione richiesta... Attendere il bando in esecuzione.")
-            self.pulsante_ricerca.setEnabled(False)  #disattiva il pulsante per evitare click multipli
+            self.pulsante_ricerca.setEnabled(False)  # disattiva il pulsante per evitare click multipli
             return
 
-        #Se la ricerca non è attiva ma i controlli di validita della data non vengono superati si ferma qui
+        # Se la ricerca non è attiva ma i controlli di validita della data non vengono superati si ferma qui
         if not self._valida_data():
             return
 
-        nome = self.campo_nome_file.text().strip() #prende il nome inserito
-        if not self._valida_nome_file():   #se il nome non supera i controlli di attività si ferma
+        # Validazione P.IVA/C.F. (se il filtro operatore e' attivo)
+        if not self._valida_piva():
+            return
+
+        nome = self.campo_nome_file.text().strip()  # prende il nome inserito
+        if not self._valida_nome_file():  # se il nome non supera i controlli di attività si ferma
             return
 
         # se non è stato inserito il nome lo genera
         if not nome:
             nome = f"bandi_pistoia_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-        #controlla se il nome ha l'estensione excel, senno la aggiunge
+        # controlla se il nome ha l'estensione excel, senno la aggiunge
         if not nome.endswith(".xlsx"):
             nome += ".xlsx"
 
-        cartella = self.label_cartella.text()  #recupera il percorso della cartella scelta
-        percorso = nome if cartella == "Cartella del progetto (default)" else f"{cartella}/{nome}"  #Crea il percorso finale
+        cartella = self.label_cartella.text()  # recupera il percorso della cartella scelta
+        percorso = nome if cartella == "Cartella del progetto (default)" else f"{cartella}/{nome}"  # Crea il percorso finale
 
-        #Lancia la funzione che avvia lo scraping, passando il percorso in cui salvare
+        # Lancia la funzione che avvia lo scraping, passando il percorso in cui salvare
         self._avvia_ricerca(percorso)
 
-    def _crea_barra_avanzamento(self):          #Costruisce la barra di progresso e stato in fondo alla pagina
+    def _crea_barra_avanzamento(self):  # Costruisce la barra di progresso e stato in fondo alla pagina
 
         # Etichetta di stato, serve per mostrare messaggi tipo "Connessione al portale..." o "Elaborazione bando 5 di 10"
         self.etichetta_stato = QLabel("")
@@ -630,25 +1466,52 @@ class BandiPistoiaApp(QMainWindow):
         self.etichetta_stato.setStyleSheet("color: #2c3e50; font-weight: 500; font-size: 12px;")
         self._layout.addWidget(self.etichetta_stato)
 
-        #Barra di progresso
+        # Barra di progresso
         self.barra = QProgressBar()
         self.barra.setFixedHeight(16)
-        self.barra.hide()   #Si nasconde all'avvio del programma, si mostra solo durante la ricerca
+        self.barra.hide()  # Si nasconde all'avvio del programma, si mostra solo durante la ricerca
         self._layout.addWidget(self.barra)
 
-        #Etichetta finale, mostra il messaggio conclusivo
+        # Etichetta finale, mostra il messaggio conclusivo
         self.etichetta_finale = QLabel("")
         self.etichetta_finale.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.etichetta_finale.setFont(QFont("Helvetica", 13, QFont.Weight.Bold))
-        self.etichetta_finale.hide()      #Nascosta, si mostra solo alla fine della ricerca
+        self.etichetta_finale.hide()  # Nascosta, si mostra solo alla fine della ricerca
         self._layout.addWidget(self.etichetta_finale)
 
-    def _avvia_ricerca(self, percorso_file):     #Prepara l'interfaccia per il caricamento e lancia il thread separato per lo scraping
-        self._interrompi.clear()   #Pulisce l'evento di interruzione (nel caso fosse rimasto "alzato" da una ricerca precedente)
-        self._ricerca_in_corso = True  #Segnala che c'è una ricerca attiva
-        self.etichetta_finale.hide()   #Nasconde eventuali messaggi di fine operazione precedenti
+    def _blocca_campi(self, blocca):
+        """
+        Disabilita (blocca=True) o riabilita (False) tutti i campi dei filtri.
+        Durante la ricerca restano congelati: modificarli non avrebbe effetto,
+        perche' la scansione usa gia' i valori di partenza. A fine ricerca o
+        dopo l'interruzione tornano modificabili, rispettando di nuovo lo stato
+        delle caselle di attivazione (data e P.IVA).
+        """
+        campi = [
+            self.campo_oggetto, self.campo_cig, self.menu_stato,
+            self.menu_tipologia, self.menu_contraente, self.campo_nome_file,
+            self.pulsante_sfoglia, self.checkbox_data, self.checkbox_piva,
+        ]
+        for c in campi:
+            c.setEnabled(not blocca)
+        # I menu data e il campo P.IVA seguono le loro caselle quando si sblocca.
+        if blocca:
+            for m in (self.menu_giorno, self.menu_mese, self.menu_anno,
+                      self.menu_giorno_fine, self.menu_mese_fine, self.menu_anno_fine,
+                      self.campo_piva):
+                m.setEnabled(False)
+        else:
+            self._toggle_data()  # riallinea i menu data allo stato della casella
+            self._toggle_piva()  # riallinea il campo P.IVA allo stato della casella
 
-        #Cambia l'aspetto e la funzione del tasto "Avvia", facendolo diventare "Interrompi" (rosso)
+    def _avvia_ricerca(self,
+                       percorso_file):  # Prepara l'interfaccia per il caricamento e lancia il thread separato per lo scraping
+        self._interrompi.clear()  # Pulisce l'evento di interruzione (nel caso fosse rimasto "alzato" da una ricerca precedente)
+        self._ricerca_in_corso = True  # Segnala che c'è una ricerca attiva
+        self.etichetta_finale.hide()  # Nasconde eventuali messaggi di fine operazione precedenti
+        self._blocca_campi(True)  # Congela tutti i filtri durante la ricerca
+
+        # Cambia l'aspetto e la funzione del tasto "Avvia", facendolo diventare "Interrompi" (rosso)
         self.pulsante_ricerca.setText("⏹  Interrompi Ricerca")
         self.pulsante_ricerca.setStyleSheet("""
             QPushButton {
@@ -664,27 +1527,34 @@ class BandiPistoiaApp(QMainWindow):
         """)
         self.pulsante_ricerca.setEnabled(True)
 
-        #Disabilita i pulsanti e i campi che non devono essere toccati mentre lo scraper lavora
+        # Disabilita i pulsanti e i campi che non devono essere toccati mentre lo scraper lavora
         self.pulsante_reset.setEnabled(False)
         self.pulsante_sfoglia.setEnabled(False)
         self.campo_nome_file.setEnabled(False)
 
-        #Inizializza la barra di progresso
+        # Inizializza la barra di progresso
         self.barra.setMaximum(0)
         self.barra.show()
         self.etichetta_stato.setText("Connessione al portale e analisi filtri...")
 
-        #Raccolta dei filtri dell'interfaccia, crea un dizionario prendendo i testi inseriti e traducendoli con le mappe scritte in cima al file
+        # Raccolta dei filtri. Si passano le ETICHETTE (es. "Aggiudicata"): la
+        # traduzione nei codici del sito la fa il motore, come per la web app.
+        # Le date sono gia' composte e completate da _componi_data (ISO o None).
+        _iso_inizio = self._componi_data("inizio")[0] if self.checkbox_data.isChecked() else ""
+        _iso_fine = self._componi_data("fine")[0] if self.checkbox_data.isChecked() else ""
         filtri = {
             "parola_chiave": self.campo_oggetto.text().strip(),
             "cig": self.campo_cig.text().strip(),
-            "stato": MAPPA_STATO[self.menu_stato.currentText()],
-            "tipologia": MAPPA_TIPOLOGIA[self.menu_tipologia.currentText()],
-            "contraente": MAPPA_CONTRAENTE[self.menu_contraente.currentText()],
-            "data_limite": (
-                f"{self.menu_anno.currentText()}-{self.menu_mese.currentText()}-{self.menu_giorno.currentText()}"
-                if self.checkbox_data.isChecked() else None
-            )
+            "stato": self.menu_stato.currentText(),
+            "tipologia": self.menu_tipologia.currentText(),
+            "contraente": self.menu_contraente.currentText(),
+            "data_limite": _iso_inizio or None,
+            "data_fine": _iso_fine or None,
+            "piva_invitato": (
+                self.campo_piva.text().strip()
+                if self.checkbox_piva.isChecked() and self.campo_piva.text().strip()
+                else None
+            ),
         }
 
         # LANCIO DEL THREAD DI BACKGROUND E DEL TIMER
@@ -696,146 +1566,125 @@ class BandiPistoiaApp(QMainWindow):
         # Fa partire il timer che ogni 100 millisecondi controllerà la coda per aggiornare i testi e la barra
         self._timer.start(100)
 
-    def _controlla_coda(self):   #Controlla periodicamente la coda dei messaggi per aggiornare l'interfaccia grafica
+    def _controlla_coda(self):  # Controlla periodicamente la coda dei messaggi per aggiornare l'interfaccia grafica
         try:
             ## Ciclo infinito per svuotare TUTTI i messaggi accumulati nella coda in quel millesimo di secondo
             while True:
-                #get_nowait() tenta di prendere un messaggio dalla coda.
+                # get_nowait() tenta di prendere un messaggio dalla coda.
                 # Se la coda è vuota, non aspetta ma lancia immediatamente l'eccezione queue.Empty
                 messaggio = self._coda.get_nowait()
                 # Estrae il tipo di messaggio (es: "stato", "barra_valore", "fine")
                 tipo = messaggio.get("tipo")
 
-                #Aggiornamento del testo di stato
+                # Aggiornamento del testo di stato
                 if tipo == "stato":
-                    #Cambia il testo dell'etichetta mostrando cosa sta facendo lo scraper
+                    # Cambia il testo dell'etichetta mostrando cosa sta facendo lo scraper
                     self.etichetta_stato.setText(messaggio.get("testo", ""))
-                #Impostazione del totale dei bandi da elaborare
+                # Impostazione del totale dei bandi da elaborare
                 elif tipo == "barra_determinata":
                     # Lo scraper ha scoperto quanti bandi ci sono in totale (es. 15).
                     # Impostiamo questo valore come massimo della barra e la azzeriamo.
                     self.barra.setMaximum(messaggio.get("totale", 100))
                     self.barra.setValue(0)
-                #Avanzamento della barra di caricamento
+                # Avanzamento della barra di caricamento
                 elif tipo == "barra_valore":
-                    #Aggiorna il quadratino blu della barra (es. bando 4 di 15, poi 5 di 15...)
+                    # Aggiorna il quadratino blu della barra (es. bando 4 di 15, poi 5 di 15...)
                     self.barra.setValue(messaggio.get("valore", 0))
-                #Processo terminato (con successo, errore o interruzione)
+                # Processo terminato (con successo, errore o interruzione)
                 elif tipo == "fine":
-                    #Ferma il Timer: non c'è più bisogno di controllare la coda
+                    # Ferma il Timer: non c'è più bisogno di controllare la coda
                     self._timer.stop()
                     # Chiama il metodo per ripristinare i pulsanti e mostrare il verdetto finale
                     self._fine_ricerca(messaggio.get("percorso"), messaggio.get("testo", ""))
-                    return       #Esce dal metodo immediatamente
+                    return  # Esce dal metodo immediatamente
         except queue.Empty:
-            pass    #Questa eccezione viene catturata quando la coda si svuota completamente.
-                    # È il segnale per uscire dal ciclo 'while True' e ridare il controllo alla GUI,
-                     # in attesa del prossimo scatto del Timer.
+            pass  # Questa eccezione viene catturata quando la coda si svuota completamente.
+            # È il segnale per uscire dal ciclo 'while True' e ridare il controllo alla GUI,
+            # in attesa del prossimo scatto del Timer.
 
-    def _esegui_ricerca(self, percorso_file, filtri):       #Esegue lo scraping
+    def _esegui_ricerca(self, percorso_file, filtri):
+        """
+        Adattatore fra la GUI e il motore condiviso avvia_ricerca_bandi.
+
+        Non contiene piu' la logica di scraping (quella e' nel motore, identico
+        a quello della web app): qui si limita a tradurre fra i due mondi.
+        - segnala_progresso -> messaggi 'barra_determinata'/'barra_valore'/'stato'
+          che la coda della GUI gia' sa interpretare;
+        - deve_fermarsi     -> l'Event di interruzione della GUI;
+        - a fine lavoro mette in coda il messaggio 'fine'.
+        Gira nel thread di sfondo che la GUI ha gia' avviato.
+        """
         try:
-            #Crea l'URL di partenza inserendo i filtri
-            url_ricerca = genera_url_con_filtri(
+            # Controllo ANAC preventivo (nel thread, non blocca la finestra).
+            # Se non risponde si avvisa e si prosegue comunque: la tabella avra'
+            # le colonne ANAC vuote, come scelto per la web app.
+            self._coda.put({"tipo": "stato", "testo": "Verifica disponibilita' ANAC..."})
+            if not anac_raggiungibile():
+                self._coda.put({"tipo": "stato",
+                                "testo": "ANAC non raggiungibile: procedo senza dati ANAC..."})
+
+            # Progresso: il motore chiama con (fatti, totale). Al primo colpo si
+            # imposta il massimo della barra; a ogni bando se ne aggiorna il valore
+            # e il testo di stato.
+            self._barra_impostata = False
+
+            def _progresso(fatti, totale):
+                if not self._barra_impostata:
+                    self._coda.put({"tipo": "barra_determinata", "totale": totale})
+                    self._barra_impostata = True
+                self._coda.put({"tipo": "stato",
+                                "testo": f"Elaborazione bando {fatti} di {totale}..."})
+                self._coda.put({"tipo": "barra_valore", "valore": fatti})
+
+            def _deve_fermarsi():
+                return self._interrompi.is_set()
+
+            # Chiamata al motore condiviso: stessa logica della web app.
+            esito = avvia_ricerca_bandi(
                 parola_chiave=filtri["parola_chiave"],
                 cig=filtri["cig"],
                 stato=filtri["stato"],
                 tipologia=filtri["tipologia"],
-                contraente=filtri["contraente"]
+                contraente=filtri["contraente"],
+                data_limite=filtri["data_limite"],
+                data_fine=filtri["data_fine"],
+                piva_invitato=filtri["piva_invitato"],
+                nome_file=percorso_file,
+                deve_fermarsi=_deve_fermarsi,
+                segnala_progresso=_progresso,
             )
-            #Scarica l'elenco di tutti i link dei bandi
-            elenco_link = estrai_lista_bandi(url_ricerca, data_limite=filtri["data_limite"])
-            totale = len(elenco_link)
 
-            # Se la lista è vuota, si ferma subito e avvisa la GUI
-            if totale == 0:
-                self._coda.put({"tipo": "fine", "percorso": None, "testo": "Nessun bando trovato con i filtri selezionati."})
+            # Interruzione: il motore esce restituendo None se fermato.
+            if self._interrompi.is_set():
+                self._coda.put({"tipo": "fine", "percorso": None,
+                                "testo": "Ricerca interrotta. Nessun file prodotto."})
                 return
 
-            # Dice alla GUI quanti bandi ci sono in totale per impostare il massimo della barra
-            self._coda.put({"tipo": "barra_determinata", "totale": totale})
+            # Esito e messaggio finale.
+            messaggio = "Completato: tabella salvata con successo."
+            if esito and esito.get("anac_giu"):
+                messaggio = ("Completato, ma ANAC non era raggiungibile: le colonne "
+                             "con i dati ANAC risultano vuote.")
+            elif esito and esito.get("anac_falliti"):
+                messaggio += f" ({esito['anac_falliti']} CIG senza dati ANAC)"
 
-            lista_risultati = []       # Conterrà i dati finali pronti per l'Excel
-            contatore_falliti = 0       # Conta quante chiamate ANAC vanno in errore o non restituiscono dati
-
-            #Ciclo di elaborazione dei singoli bandi, li enumera partendo da 1
-            for i, link in enumerate(elenco_link, 1):
-                #Verifica se l'utente ha cliccato interrompi
-                if self._interrompi.is_set():
-                    self._coda.put({
-                        "tipo": "fine", "percorso": None,
-                        "testo": f"Ricerca interrotta dopo {i - 1} bandi su {totale}."
-                    })
-                    return
-
-                #Dalla seconda richiesta in poi aspetta 1,5 secondi per non sovraccaricare il server della provincia
-                if i > 1:
-                    time.sleep(1.5)
-
-                # Aggiorna il testo di stato e la posizione della barra sulla GUI
-                self._coda.put({"tipo": "stato", "testo": f"Elaborazione bando {i} di {totale}..."})
-                self._coda.put({"tipo": "barra_valore", "valore": i})
-
-                # Ricostruisce l'URL assoluto della pagina del bando se il link estratto è relativo
-                url_completo = f"{BASE_URL}{link}" if not link.startswith("http") else link
-
-                # Entra nella pagina del bando ed estrae le informazioni (Oggetto, Scadenza, lista CIG, ecc.)
-                dati_bando = estrai_dettagli_bando(url_completo)
-                lista_cig = dati_bando.get("cig_list", [])
-
-                #Logica per il codice CIG dei singoli bandi
-                if not lista_cig:    #Se il bando non ha codici CIG inseriti nella pagina della Provincia
-                    #Salva comunque il bando lasciando vuoti i dati ANAC
-                    lista_risultati.append({"provincia": dati_bando, "anac": {}, "cig_corrente": "Non trovato"})
-                else:    #Se il bando contiene uno o più codici CIG
-                    for cig_singolo in lista_cig:
-                        if self._interrompi.is_set():    #Controllo di interruzione
-                            break
-
-                        #Interroga l'API di ANAC passando il singolo codice CIG
-                        json_anac = scarica_json_anac(cig_singolo)
-                        dati_anac = {}
-
-                        if json_anac:
-                            #Se l'API risponde correttamente, estrae le informazioni strutturate (importo, aggiudicatario...)
-                            dati_anac = estrai_dati_json_anac(json_anac)
-                        else:
-                            #Se la chiamata fallisce o il CIG non esiste su ANAC, incrementa il contatore degli errori
-                            contatore_falliti += 1
-
-                        #Unisce i dati della Provincia, i dati ANAC e il CIG di riferimento in un unico blocco
-                        lista_risultati.append({"provincia": dati_bando, "anac": dati_anac, "cig_corrente": cig_singolo})
-
-                        time.sleep(1)       #Pausa di 1 secondo tra una chiamata ANAC e la successiva
-
-            #Esportazione file
-            #Dopo che tutti i bandi sono stati elaborati comunica il salvataggio
-            self._coda.put({"tipo": "stato", "testo": "Salvataggio file Excel..."})
-
-            #Genera il file Excel finale scrivendo i dati ottenuti
-            salva_in_excel(lista_risultati, nome_file=percorso_file)
-
-            #Messaggio di successo
-            messaggio = f"✅  Completato! {totale} bandi elaborati ed esportati con successo."
-            if contatore_falliti > 0:
-                messaggio += f" ({contatore_falliti} CIG senza dati ANAC)"
-
-            #Invia il segnale di fine alla GUI passando il messaggio e il percorso del file creato
             self._coda.put({"tipo": "fine", "percorso": percorso_file, "testo": messaggio})
 
         except Exception as e:
-            # GESTIONE ERRORI CRITICI: Se qualcosa va in crash (es. salta internet),
-            # cattura l'errore e lo mostra all'utente in modo sicuro senza far crashare l'intera app
             self._coda.put({"tipo": "fine", "percorso": None, "testo": f"Errore: {e}"})
 
-    def _fine_ricerca(self, percorso_file, messaggio):  #Ripristina l'interfaccia al termine dello scraping o in caso di interruzione
+    def _fine_ricerca(self, percorso_file,
+                      messaggio):  # Ripristina l'interfaccia al termine dello scraping o in caso di interruzione
 
-        self._ricerca_in_corso = False      #Reset dello stato interno, dice che non c'è più nessuna ricerca in corso
+        self._ricerca_in_corso = False  # Reset dello stato interno, dice che non c'è più nessuna ricerca in corso
 
-        self.barra.hide()     #Nasconde la barra di caricamento
+        self._blocca_campi(False)  # Riabilita i filtri (a fine ricerca o dopo interruzione)
 
-        self.etichetta_stato.setText("")        #Nasconde la scritta che mostrava i passaggi
+        self.barra.hide()  # Nasconde la barra di caricamento
 
-        #Ripristina il pulsante principale, trasforma il pulsante rosso interrompi nel pulsante originale avvia ricerca
+        self.etichetta_stato.setText("")  # Nasconde la scritta che mostrava i passaggi
+
+        # Ripristina il pulsante principale, trasforma il pulsante rosso interrompi nel pulsante originale avvia ricerca
         self.pulsante_ricerca.setText("🔍  Avvia Ricerca")
         self.pulsante_ricerca.setStyleSheet("""
             QPushButton {
@@ -850,19 +1699,22 @@ class BandiPistoiaApp(QMainWindow):
                 background-color: #155cb4;
             }
         """)
-        self.pulsante_ricerca.setEnabled(True) # Riattiva il pulsante
+        self.pulsante_ricerca.setEnabled(True)  # Riattiva il pulsante
 
-        #Riattiva tutti i pulsanti che erano stati disattivati per sicurezza durante la ricerca
+        # Riattiva tutti i pulsanti che erano stati disattivati per sicurezza durante la ricerca
         self.pulsante_reset.setEnabled(True)
         self.pulsante_sfoglia.setEnabled(True)
         self.campo_nome_file.setEnabled(True)
 
-        #Logica dei colori: se 'percorso_file' esiste (True), significa che il file è stato salvato con successo
+        # Logica dei colori: se 'percorso_file' esiste (True), significa che il file è stato salvato con successo
         # e usa il verde. Se è None (False), significa errore, nessun bando o interruzione, e usa l'arancione.
         colore = "#2ecc71" if percorso_file else "#e67e22"
-        self.etichetta_finale.setStyleSheet(f"color: {colore}; font-weight: bold;")  # Applica il colore scelto e imposta il grassetto
-        self.etichetta_finale.setText(messaggio)     # Inserisce il testo (es. "Completato! 10 bandi elaborati" oppure "Operazione interrotta")
-        self.etichetta_finale.show()   # Rende finalmente visibile il messaggio di risultato in fondo all'applicazione
+        self.etichetta_finale.setStyleSheet(
+            f"color: {colore}; font-weight: bold;")  # Applica il colore scelto e imposta il grassetto
+        self.etichetta_finale.setText(
+            messaggio)  # Inserisce il testo (es. "Completato! 10 bandi elaborati" oppure "Operazione interrotta")
+        self.etichetta_finale.show()  # Rende finalmente visibile il messaggio di risultato in fondo all'applicazione
+
 
 if __name__ == "__main__":
     # Controlla se la versione di Qt in uso possiede l'attributo per lo scaling automatico.
@@ -874,10 +1726,17 @@ if __name__ == "__main__":
     if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
 
-    #INIZIALIZZAZIONE E AVVIO DELL'APPLICAZIONE
+    # INIZIALIZZAZIONE E AVVIO DELL'APPLICAZIONE
     # Crea l'oggetto QApplication fondamentale. Gestisce il flusso di controllo,
     # le impostazioni principali e riceve gli argomenti passati da riga di comando (sys.argv).
     app = QApplication(sys.argv)
+
+    # Stile "Fusion": rende l'interfaccia indipendente dal tema nativo del
+    # sistema operativo. Serve soprattutto su macOS, dove il tema di default
+    # ignora alcune personalizzazioni CSS dei menu a tendina (la freccina e il
+    # colore delle voci selezionate). Con Fusion tutte le regole di stile
+    # vengono rispettate in modo uniforme su Windows, Mac e Linux.
+    app.setStyle("Fusion")
 
     # Istanzia la classe della nostra interfaccia grafica (chiamando il metodo __init__ )
     finestra = BandiPistoiaApp()

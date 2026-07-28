@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ricerca Bandi di Gara - Provincia di Pistoia</title>
+  <link href="https://fonts.googleapis.com/css2?family=Titillium+Web:wght@400;600;700&family=Roboto+Mono&display=swap" rel="stylesheet">
+  <style>
+    /* Palette e tipografia del design system .italia (Bootstrap Italia),
+       obbligatorio per i siti della Pubblica Amministrazione. Colore primario
+       Blu Italia, font Titillium Web per i testi. */
+    :root {
+      --blu-italia: #0066CC;
+      --blu-scuro: #004080;
+      --blu-tenue: #e6f0fa;
+      --grigio-bordo: #b1b1b3;
+      --grigio-chiaro: #f2f7fc;
+      --testo: #1c1c1c;
+      --verde-ok: #008758;
+      --rosso-err: #d9364f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Titillium Web", Geneva, Tahoma, sans-serif;
+      background: var(--grigio-chiaro);
+      color: var(--testo);
+      margin: 0;
+      padding: 0;
+      font-size: 16px;
+    }
+    /* Barra istituzionale in cima, come nei portali .italia */
+    .barra-ente {
+      background: var(--blu-scuro);
+      color: #fff;
+      font-size: 13px;
+      padding: 6px 0;
+    }
+    .barra-ente .interno { max-width: 1100px; margin: 0 auto; padding: 0 32px; }
+    /* La FASCIA blu occupa tutta la larghezza; il suo CONTENUTO resta centrato
+       in una colonna leggibile. Stesso schema per il pannello bianco. */
+    .fascia-intestazione { background: var(--blu-italia); width: 100%; }
+    .contenitore { max-width: 1100px; margin: 0 auto; padding: 0 32px; }
+    .intestazione {
+      color: #fff;
+      padding: 26px 0;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+    }
+    .stemma {
+      width: 52px; height: 52px; flex-shrink: 0;
+      background: #fff; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; color: var(--blu-italia); font-size: 20px;
+    }
+    .intestazione h1 { margin: 0; font-size: 24px; font-weight: 700; }
+    .intestazione p { margin: 3px 0 0; opacity: .9; font-size: 14px; font-weight: 400; }
+    /* La fascia bianca del contenuto va da bordo a bordo; dentro, il pannello
+       coi filtri resta centrato e stretto. */
+    .fascia-contenuto { background: #fff; width: 100%; min-height: 70vh;
+                        border-top: 3px solid var(--blu-scuro);
+                        padding: 30px 0 60px; }
+    .pannello {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 32px;
+    }
+    .sezione { margin-bottom: 26px; }
+    .sezione h2 {
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      color: var(--blu-italia);
+      font-weight: 700;
+      border-bottom: 1px solid var(--blu-tenue);
+      padding-bottom: 8px;
+      margin: 0 0 16px;
+    }
+    label { display: block; font-size: 14px; font-weight: 600; margin: 0 0 5px; }
+    input, select {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--grigio-bordo);
+      border-radius: 4px;
+      font-size: 15px;
+      font-family: inherit;
+      height: 42px;
+      background: #fff;
+    }
+    input:focus, select:focus {
+      outline: 2px solid var(--blu-italia);
+      outline-offset: 1px;
+      border-color: var(--blu-italia);
+    }
+    .riga { display: flex; gap: 16px; }
+    .riga > div { flex: 1; }
+    .campo { margin-bottom: 14px; }
+    .aiuto { font-size: 13px; color: #5a768d; margin: 4px 0 0; }
+    .pulsante {
+      background: var(--blu-italia);
+      color: #fff;
+      border: none;
+      padding: 13px 22px;
+      border-radius: 4px;
+      font-size: 16px;
+      font-weight: 700;
+      font-family: inherit;
+      cursor: pointer;
+      width: 100%;
+      transition: background .15s;
+    }
+    .pulsante:hover { background: var(--blu-scuro); }
+    .pulsante:disabled { background: #a0a0a0; cursor: not-allowed; }
+    .pulsantiera { display: flex; gap: 14px; }
+    .pulsantiera .pulsante { flex: 1; }
+    .pulsante.secondario {
+      background: #fff;
+      color: var(--blu-italia);
+      border: 2px solid var(--blu-italia);
+    }
+    .pulsante.secondario:hover { background: var(--blu-tenue); }
+    /* Durante la ricerca il pulsante Avvia diventa Interrompi: rosso per
+       segnalare l'azione di annullamento. */
+    .pulsante.interrompi { background: var(--rosso-err); }
+    .pulsante.interrompi:hover { background: #a51c30; }
+    #esito { margin-top: 20px; }
+    .messaggio {
+      padding: 15px 18px;
+      border-radius: 4px;
+      font-size: 15px;
+      display: none;
+      border-left: 4px solid;
+    }
+    .in-corso { background: var(--blu-tenue); border-color: var(--blu-italia); color: var(--blu-scuro); display: block; }
+    .ok { background: #e0f5ec; border-color: var(--verde-ok); color: #00593b; display: block; }
+    .errore { background: #fbe6e9; border-color: var(--rosso-err); color: #a51c30; display: block; }
+    .spinner {
+      display: inline-block; width: 15px; height: 15px;
+      border: 2px solid #b8d4f0; border-top-color: var(--blu-italia);
+      border-radius: 50%; animation: gira .8s linear infinite;
+      vertical-align: middle; margin-right: 8px;
+    }
+    @keyframes gira { to { transform: rotate(360deg); } }
+    a.scarica {
+      display: inline-block; margin-top: 12px;
+      background: var(--verde-ok); color: #fff; text-decoration: none;
+      padding: 10px 18px; border-radius: 4px; font-weight: 700;
+    }
+    a.scarica:hover { background: #00593b; }
+    .attiva {
+      display: flex; align-items: center; gap: 9px;
+      font-weight: 600; font-size: 15px; margin-bottom: 14px; cursor: pointer;
+    }
+    .attiva input { width: auto; height: auto; margin: 0; cursor: pointer; accent-color: var(--blu-italia); }
+    .spento { opacity: .5; pointer-events: none; }
+    input:disabled, select:disabled { background: #eaeaea; cursor: not-allowed; }
+    .data-menu { display: flex; gap: 7px; }
+    .data-menu select { flex: 1; padding: 10px 6px; }
+    code { font-family: "Roboto Mono", monospace; font-size: 14px; }
+    /* Barra di avanzamento: mostrata durante la ricerca, dice a che bando si e'
+       arrivati sul totale. */
+    .progresso { margin-top: 16px; display: none; }
+    .progresso .barra-sfondo {
+      background: var(--blu-tenue);
+      border-radius: 6px;
+      height: 22px;
+      overflow: hidden;
+    }
+    .progresso .barra-avanti {
+      background: var(--blu-italia);
+      height: 100%;
+      width: 0%;
+      transition: width .3s ease;
+    }
+    .progresso .etichetta {
+      font-size: 14px; font-weight: 600; color: var(--blu-scuro);
+      margin-top: 6px; text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="barra-ente">
+    <div class="interno">Regione Toscana - Provincia di Pistoia</div>
+  </div>
+  <div class="fascia-intestazione">
+    <div class="contenitore">
+      <div class="intestazione">
+        <div class="stemma">PT</div>
+        <div>
+          <h1>Ricerca Bandi di Gara</h1>
+          <p>Estrazione dati appalti e generazione tabella Excel</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="fascia-contenuto">
+    <div class="pannello">
+
+      <div class="sezione">
+        <h2>Filtri di ricerca</h2>
+        <div class="campo">
+          <label>Oggetto del bando</label>
+          <input type="text" id="parola_chiave" placeholder="Qualsiasi...">
+        </div>
+        <div class="campo">
+          <label>CIG</label>
+          <input type="text" id="cig" placeholder="Qualsiasi...">
+        </div>
+        <div class="riga">
+          <div>
+            <label>Stato</label>
+            <select id="stato">
+              {% for s in stati %}<option>{{ s }}</option>{% endfor %}
+            </select>
+          </div>
+          <div>
+            <label>Tipologia</label>
+            <select id="tipologia">
+              {% for t in tipologie %}<option>{{ t }}</option>{% endfor %}
+            </select>
+          </div>
+        </div>
+        <div class="campo" style="margin-top:12px">
+          <label>Scelta contraente</label>
+          <select id="contraente">
+            {% for c in contraenti %}<option>{{ c }}</option>{% endfor %}
+          </select>
+        </div>
+      </div>
+
+      <div class="sezione">
+        <h2>Periodo di pubblicazione</h2>
+        <label class="attiva">
+          <input type="checkbox" id="usa_data" onchange="toggle('data')">
+          Filtra per data di pubblicazione
+        </label>
+        <div class="riga" id="blocco_data">
+          <div>
+            <label>Data inizio</label>
+            <div class="data-menu">
+              <select id="gi_inizio" disabled>
+                <option value="">--</option>
+                {% for g in giorni %}<option>{{ g }}</option>{% endfor %}
+              </select>
+              <select id="me_inizio" disabled>
+                <option value="">--</option>
+                {% for m in mesi %}<option>{{ m }}</option>{% endfor %}
+              </select>
+              <select id="an_inizio" disabled>
+                <option value="">--</option>
+                {% for a in anni %}<option>{{ a }}</option>{% endfor %}
+              </select>
+            </div>
+            <p class="aiuto">Solo anno o anno+mese sono ammessi (i vuoti si completano)</p>
+          </div>
+          <div>
+            <label>Data fine</label>
+            <div class="data-menu">
+              <select id="gi_fine" disabled>
+                <option value="">--</option>
+                {% for g in giorni %}<option>{{ g }}</option>{% endfor %}
+              </select>
+              <select id="me_fine" disabled>
+                <option value="">--</option>
+                {% for m in mesi %}<option>{{ m }}</option>{% endfor %}
+              </select>
+              <select id="an_fine" disabled>
+                <option value="">--</option>
+                {% for a in anni %}<option>{{ a }}</option>{% endfor %}
+              </select>
+            </div>
+            <p class="aiuto">Solo anno o anno+mese sono ammessi (i vuoti si completano)</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="sezione">
+        <h2>Ricerca per operatore</h2>
+        <label class="attiva">
+          <input type="checkbox" id="usa_piva" onchange="toggle('piva')">
+          Filtra per un operatore invitato
+        </label>
+        <div class="campo" id="blocco_piva">
+          <label>P.IVA o codice fiscale invitato</label>
+          <input type="text" id="piva_invitato" placeholder="P.IVA o C.F. dell'operatore" disabled>
+          <p class="aiuto">In tabella finiscono solo i bandi in cui l'operatore e' fra gli invitati</p>
+        </div>
+      </div>
+
+      <div class="sezione">
+        <h2>Salvataggio</h2>
+        <div class="campo">
+          <label>Nome file Excel</label>
+          <input type="text" id="nome_file" placeholder="Vuoto = generazione automatica">
+        </div>
+      </div>
+
+      <div class="pulsantiera">
+        <button class="pulsante secondario" id="reset" onclick="resetFiltri()">Reset filtri</button>
+        <button class="pulsante" id="avvia" onclick="avvia()">Avvia ricerca</button>
+      </div>
+
+      <div id="esito">
+        <div class="messaggio" id="messaggio"></div>
+        <div class="progresso" id="progresso">
+          <div class="barra-sfondo"><div class="barra-avanti" id="barraAvanti"></div></div>
+          <div class="etichetta" id="etichettaProgresso"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    let intervallo = null;
+    let jobCorrente = null;   // id della ricerca in corso, per poterla interrompere
+
+    // I blocchi data e P.IVA partono spenti, come nell'interfaccia originale:
+    // l'utente li attiva con la casella quando servono.
+    document.addEventListener("DOMContentLoaded", () => {
+      toggle("data");
+      toggle("piva");
+    });
+
+    // Attiva o disattiva un blocco di filtri in base alla sua casella. I campi
+    // spenti diventano grigi, non cliccabili, e vengono ignorati all'invio.
+    function toggle(nome) {
+      const attivo = document.getElementById("usa_" + nome).checked;
+      const blocco = document.getElementById("blocco_" + nome);
+      blocco.classList.toggle("spento", !attivo);
+      blocco.querySelectorAll("input, select").forEach(e => e.disabled = !attivo);
+    }
+
+    // Compone una data gg/mm/aaaa dai tre menu. Restituisce "" se manca un
+    // pezzo (la data fine puo' essere lasciata a "--" per non impostarla).
+    // Compone una data dai tre menu, permettendo di ometterne dei pezzi.
+    // Combinazioni valide (si compila da sinistra): solo anno, anno+mese,
+    // anno+mese+giorno. Le altre (mese senza anno, giorno senza mese) sono
+    // incoerenti e vengono segnalate.
+    // I pezzi mancanti si completano secondo il "verso":
+    //   inizio -> primo istante (1 gennaio / 1 del mese)
+    //   fine   -> ultimo istante (31 dicembre / ultimo giorno del mese)
+    // Ritorna { data: "gg/mm/aaaa" | "", errore: "" | testo }.
+    function componiData(suffisso, verso) {
+      const g = val("gi_" + suffisso), m = val("me_" + suffisso), a = val("an_" + suffisso);
+
+      if (!a && !m && !g) return { data: "", errore: "" };   // niente impostato
+      if (!a && (m || g))
+        return { data: "", errore: "Per la data serve almeno l'anno." };
+      if (a && !m && g)
+        return { data: "", errore: "Con il giorno indica anche il mese." };
+
+      // Completa i pezzi mancanti in base al verso.
+      let mm = m, gg = g;
+      if (!mm) mm = (verso === "fine") ? "12" : "01";
+      if (!gg) gg = (verso === "fine") ? String(ultimoGiorno(Number(a), Number(mm))).padStart(2, "0") : "01";
+      return { data: `${gg}/${mm}/${a}`, errore: "" };
+    }
+
+    // Ultimo giorno reale di un mese (gestisce 28/29/30/31).
+    function ultimoGiorno(anno, mese) {
+      return new Date(anno, mese, 0).getDate();
+    }
+
+    // Verifica che una data gg/mm/aaaa esista davvero: ricostruisce la data e
+    // controlla che i pezzi combacino (cosi' 31/02 viene respinto, perche'
+    // JavaScript lo trasformerebbe in 03/03).
+    function dataValida(gg_mm_aaaa) {
+      const [g, m, a] = gg_mm_aaaa.split("/").map(Number);
+      const d = new Date(a, m - 1, g);
+      return d.getFullYear() === a && d.getMonth() === m - 1 && d.getDate() === g;
+    }
+
+    // gg/mm/aaaa -> aaaa-mm-gg, per confrontare due date come stringhe.
+    function iso(gg_mm_aaaa) {
+      const [g, m, a] = gg_mm_aaaa.split("/");
+      return `${a}-${m}-${g}`;
+    }
+
+    async function avvia(saltaAnac = false) {
+      const btn = document.getElementById("avvia");
+      const msg = document.getElementById("messaggio");
+
+      const usaData = document.getElementById("usa_data").checked;
+      const usaPiva = document.getElementById("usa_piva").checked;
+
+      // I controlli vengono PRIMA di toccare il pulsante: se qualcosa non va,
+      // si mostra l'errore e si esce, lasciando il pulsante nello stato normale
+      // (altrimenti resterebbe bloccato su "Ricerca in corso").
+      const problemi = [];
+      let dInizio = "", dFine = "";
+      if (usaData) {
+        const ci = componiData("inizio", "inizio");
+        const cf = componiData("fine", "fine");
+        if (ci.errore) problemi.push("Data inizio: " + ci.errore);
+        if (cf.errore) problemi.push("Data fine: " + cf.errore);
+        dInizio = ci.data;
+        dFine = cf.data;
+        if (dInizio && !dataValida(dInizio))
+          problemi.push("La data di inizio non esiste (controlla il giorno).");
+        if (dFine && !dataValida(dFine))
+          problemi.push("La data di fine non esiste (controlla il giorno).");
+        if (dInizio && dFine && iso(dFine) < iso(dInizio))
+          problemi.push("La data di fine precede quella di inizio.");
+      }
+      // P.IVA (11 cifre) o codice fiscale (16 caratteri): controllo solo se compilato.
+      let piva = "";
+      if (usaPiva) {
+        piva = val("piva_invitato");
+        const pulito = piva.replace(/[\s.\-\/]/g, "").toUpperCase().replace(/^IT/, "");
+        if (piva && pulito.length !== 11 && pulito.length !== 16)
+          problemi.push("La P.IVA deve avere 11 cifre, il codice fiscale 16 caratteri.");
+      }
+      const nome = val("nome_file");
+      const vietati = nome.split("").filter(c => '/\\:*?"<>|'.includes(c));
+      if (vietati.length)
+        problemi.push("Il nome del file contiene caratteri non ammessi: " + [...new Set(vietati)].join(" "));
+
+      if (problemi.length) {
+        mostraErrore(problemi.join(" "));
+        return;
+      }
+
+      // Solo ora, superati i controlli, si blocca il pulsante e parte la ricerca.
+      // Il pulsante Avvia si trasforma in Interrompi (non piu' disabilitato).
+      btn.textContent = "Interrompi ricerca";
+      btn.classList.add("interrompi");
+      btn.onclick = interrompi;
+      document.getElementById("reset").disabled = true;
+      bloccaCampi(true);   // congela tutti i filtri durante la ricerca
+      msg.className = "messaggio in-corso";
+      msg.innerHTML = '<span class="spinner"></span>Ricerca avviata. Puo\' richiedere alcuni minuti, non chiudere la pagina.';
+
+      const filtri = {
+        parola_chiave: val("parola_chiave"),
+        cig: val("cig"),
+        stato: val("stato"),
+        tipologia: val("tipologia"),
+        contraente: val("contraente"),
+        data_inizio: usaData ? dInizio : "",
+        data_fine: usaData ? dFine : "",
+        piva_invitato: usaPiva ? piva : "",
+        nome_file: nome,
+        salta_anac: saltaAnac,
+      };
+
+      try {
+        const r = await fetch("/avvia", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(filtri),
+        });
+        const dati = await r.json();
+        if (!r.ok) {
+          // Il server ha respinto la richiesta (validazione fallita).
+          mostraErrore(dati.errore || "Richiesta non valida.");
+          ripristina();
+          return;
+        }
+        // ANAC irraggiungibile: si mostra l'avviso e si chiede conferma. Il
+        // pulsante diventa "Procedi senza dati ANAC"; premuto, rilancia la
+        // ricerca con il consenso a saltare ANAC.
+        if (dati.anac_giu) {
+          const msg = document.getElementById("messaggio");
+          msg.className = "messaggio errore";
+          msg.textContent = dati.avviso;
+          btn.textContent = "Procedi senza dati ANAC";
+          btn.onclick = () => avvia(true);
+          document.getElementById("reset").disabled = false;
+          return;
+        }
+        jobCorrente = dati.id_job;
+        controlla(dati.id_job);
+      } catch (e) {
+        mostraErrore("Impossibile avviare la ricerca: " + e);
+      }
+    }
+
+    function controlla(idJob) {
+      intervallo = setInterval(async () => {
+        try {
+          const r = await fetch("/stato/" + idJob);
+          const s = await r.json();
+          // Aggiorna la barra di avanzamento finche' la ricerca e' in corso.
+          if (s.stato === "in_corso" && s.totale > 0) {
+            // "Elaborazione bando i di N": si sta lavorando l'i-esimo. La barra
+            // mostra il lavoro concluso (i-1 completati), la scritta dice cosa
+            // e' in corso ORA.
+            const completati = s.fatti - 1;
+            const perc = Math.round((completati / s.totale) * 100);
+            document.getElementById("progresso").style.display = "block";
+            document.getElementById("barraAvanti").style.width = perc + "%";
+            document.getElementById("etichettaProgresso").textContent =
+              `Elaborazione bando ${s.fatti} di ${s.totale} (${perc}%)`;
+          }
+          if (s.stato === "finito") {
+            clearInterval(intervallo);
+            document.getElementById("progresso").style.display = "none";
+            const msg = document.getElementById("messaggio");
+            // Se ANAC e' caduto DURANTE la scansione, il file c'e' ma con le
+            // colonne ANAC vuote: si avvisa, mantenendo il link al download.
+            if (s.avviso) {
+              msg.className = "messaggio errore";
+              msg.innerHTML = s.avviso
+                + '<br><a class="scarica" href="/scarica/' + encodeURIComponent(s.file) + '">Scarica comunque il file</a>';
+            } else {
+              msg.className = "messaggio ok";
+              msg.innerHTML = "Ricerca completata."
+                + '<br><a class="scarica" href="/scarica/' + encodeURIComponent(s.file) + '">Scarica il file Excel</a>';
+            }
+            ripristina();
+          } else if (s.stato === "errore") {
+            clearInterval(intervallo);
+            mostraErrore("Errore durante la ricerca: " + s.errore);
+            ripristina();
+          } else if (s.stato === "interrotto") {
+            clearInterval(intervallo);
+            const msg = document.getElementById("messaggio");
+            msg.className = "messaggio errore";
+            msg.textContent = "Ricerca interrotta. Nessun file prodotto.";
+            ripristina();
+          }
+        } catch (e) {
+          clearInterval(intervallo);
+          mostraErrore("Connessione persa: " + e);
+          ripristina();
+        }
+      }, 2000);
+    }
+
+    // Chiede al server di interrompere: alza la bandiera di stop. La ricerca si
+    // ferma alla fine del bando in corso, quindi il pulsante mostra l'attesa.
+    async function interrompi() {
+      if (!jobCorrente) return;
+      const btn = document.getElementById("avvia");
+      btn.disabled = true;
+      btn.textContent = "Interruzione in corso...";
+      try {
+        await fetch("/interrompi/" + jobCorrente, { method: "POST" });
+      } catch (e) {
+        mostraErrore("Impossibile interrompere: " + e);
+      }
+      // Lo stato "interrotto" arrivera' dal polling, che chiamera' ripristina().
+    }
+
+    function mostraErrore(testo) {
+      const msg = document.getElementById("messaggio");
+      msg.className = "messaggio errore";
+      msg.textContent = testo;
+    }
+
+    function ripristina() {
+      const btn = document.getElementById("avvia");
+      btn.disabled = false;
+      btn.textContent = "Avvia ricerca";
+      btn.classList.remove("interrompi");
+      btn.onclick = avvia;
+      document.getElementById("reset").disabled = false;
+      document.getElementById("progresso").style.display = "none";
+      bloccaCampi(false);   // riabilita i filtri a fine o dopo interruzione
+      jobCorrente = null;
+    }
+
+    // Blocca o sblocca tutti i campi del form (filtri, menu, caselle). Durante
+    // la ricerca restano congelati: modificarli non avrebbe effetto, perche' la
+    // scansione usa gia' i valori di partenza. Le caselle di attivazione, una
+    // volta riabilitate, rispettano di nuovo lo stato dei loro toggle.
+    function bloccaCampi(blocca) {
+      const ids = ["parola_chiave", "cig", "stato", "tipologia", "contraente",
+                   "nome_file", "usa_data", "usa_piva",
+                   "gi_inizio", "me_inizio", "an_inizio",
+                   "gi_fine", "me_fine", "an_fine", "piva_invitato"];
+      ids.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = blocca;
+      });
+      if (!blocca) {
+        // Ripristina lo stato reale dei blocchi data/P.IVA secondo le caselle.
+        toggle("data");
+        toggle("piva");
+      }
+    }
+
+    function val(id) { return document.getElementById(id).value.trim(); }
+
+    // Riporta tutti i filtri allo stato iniziale: campi vuoti, menu sulla prima
+    // voce, caselle spente (quindi data e P.IVA di nuovo disattivate).
+    function resetFiltri() {
+      ["parola_chiave", "cig", "piva_invitato", "nome_file"].forEach(id => {
+        document.getElementById(id).value = "";
+      });
+      document.querySelectorAll("select").forEach(s => s.selectedIndex = 0);
+      document.getElementById("usa_data").checked = false;
+      document.getElementById("usa_piva").checked = false;
+      toggle("data");
+      toggle("piva");
+      const msg = document.getElementById("messaggio");
+      msg.className = "messaggio";
+      msg.textContent = "";
+    }
+  </script>
+</body>
+</html>
