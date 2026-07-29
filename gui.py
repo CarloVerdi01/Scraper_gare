@@ -1,4 +1,5 @@
 import sys
+import os
 import threading
 import time
 import queue
@@ -18,9 +19,26 @@ from scraper import (genera_url_con_filtri, estrai_lista_bandi, BASE_URL,
                      reimposta_via_anac)
 from scraper_pdf import (estrai_dati_pdf_esito, estrai_link_pdf_esito,
                          seleziona_pdf_per_cig, seleziona_lotto_per_cig, risolvi_cig,
-                         costruisci_lista_cig, cig_compatibile, invitato_con_piva,
-                         normalizza_piva)
+                         costruisci_lista_cig, cig_compatibile, invitato_con_piva)
 from save_data import salva_in_excel
+
+
+def cartella_download():
+    """
+    Percorso della cartella Download dell'utente, o stringa vuota se non c'e'.
+
+    E' la destinazione predefinita dei file Excel: chi usa il programma
+    conosce la propria cartella Download, mentre non ha motivo di sapere dove
+    sia installato il progetto.
+
+    La stringa vuota fa da ripiego elegante: os.path.join("", "bandi.xlsx")
+    restituisce "bandi.xlsx", cioe' il salvataggio nella cartella del
+    progetto, esattamente il comportamento di prima. Serve per i sistemi dove
+    la cartella non esiste o ha un altro nome: su Linux, per esempio, con
+    interfaccia in italiano puo' chiamarsi "Scaricati".
+    """
+    percorso = os.path.join(os.path.expanduser("~"), "Downloads")
+    return percorso if os.path.isdir(percorso) else ""
 
 # =====================================================================
 # MAPPE FILTRI
@@ -194,85 +212,10 @@ STILE_APPLICAZIONE = """
 # che parlano con la coda della finestra (progresso, interruzione).
 # ============================================================
 
-def _stampa_operatore(op, indent="            ", numero=None):
-    """Stampa un operatore sia se è un dict {"nome":..,"piva":..,"cf":..} sia se è una stringa."""
-    prefisso = f"{numero}. " if numero is not None else "* "
-    if isinstance(op, dict):
-        _pv = op.get("piva", "Non presente")
-        _cf = op.get("cf", "Non presente")
-        # Il C.F. si mostra solo quando AGGIUNGE informazione: se coincide con
-        # la P.IVA (etichetta unica "CF/P.IVA") ripeterlo appesantirebbe il log.
-        # Resta invece essenziale per i professionisti persone fisiche, il cui
-        # C.F. e' alfanumerico, e per le imprese con i due codici distinti.
-        _codici = []
-        if _pv != "Non presente":
-            _codici.append(f"P.IVA: {_pv}")
-        if _cf != "Non presente" and _cf != _pv:
-            _codici.append(f"C.F.: {_cf}")
-        if _codici:
-            print(f"{indent}{prefisso}{op['nome']} ({', '.join(_codici)})")
-        else:
-            print(f"{indent}{prefisso}{op['nome']}")
-    else:
-        print(f"{indent}{prefisso}{op}")
-
-
-def _stampa_lista_operatori(operatori, dichiarati, etichetta, piva_cercata=None):
-    """
-    Stampa una lista di operatori (manifestanti o invitati).
-
-    Quando e' attiva la ricerca per operatore, elencare tutti gli invitati
-    seppellirebbe l'unica riga che interessa sotto centinaia di nomi (i bandi
-    piu' grandi ne hanno oltre 300): si stampa allora il solo operatore
-    cercato, indicando comunque quanti erano in totale. La lista COMPLETA
-    resta nei dati e finira' regolarmente nel salvataggio: qui cambia solo
-    cio' che si vede a schermo.
-    """
-    print(f"        -> [PDF] {etichetta}: {dichiarati}")
-    if not piva_cercata:
-        for j, op in enumerate(operatori or [], 1):
-            _stampa_operatore(op, numero=j)
-        return
-    cercata = normalizza_piva(piva_cercata)
-    trovati = [op for op in (operatori or [])
-               if isinstance(op, dict)
-               and cercata in (normalizza_piva(op.get("piva")), normalizza_piva(op.get("cf")))]
-    for op in trovati:
-        _stampa_operatore(op)
-    if not trovati:
-        print(f"            (operatore cercato non presente in questa lista)")
-    elif len(operatori or []) > len(trovati):
-        print(f"            ... e altri {len(operatori) - len(trovati)} operatori non mostrati")
-
-
-def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="qualsiasi", contraente="qualsiasi",
-                        data_limite=None, data_fine=None, piva_invitato=None, nome_file=None, deve_fermarsi=None,
-                        segnala_progresso=None):
+def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="qualsiasi", contraente="qualsiasi", data_limite=None, data_fine=None, piva_invitato=None, nome_file=None, deve_fermarsi=None, segnala_progresso=None):
     codice_stato = MAPPA_STATO[stato]
     codice_tipologia = MAPPA_TIPOLOGIA[tipologia]
     codice_contraente = MAPPA_CONTRAENTE[contraente]
-
-    filtri_attivi = []
-    if parola_chiave: filtri_attivi.append(f"Oggetto/Parola chiave: '{parola_chiave}'")
-    if cig: filtri_attivi.append(f"CIG: '{cig}'")
-    if stato != "Qualsiasi": filtri_attivi.append(f"Stato: '{stato}' (Codice: {codice_stato})")
-    if tipologia != "Qualsiasi": filtri_attivi.append(f"Tipologia: '{tipologia}' (Codice: {codice_tipologia})")
-    if contraente != "Qualsiasi": filtri_attivi.append(
-        f"Scelta Contraente: '{contraente}' (Codice: {codice_contraente})")
-    if piva_invitato: filtri_attivi.append(f"Solo bandi con invitato P.IVA/C.F.: '{piva_invitato}'")
-    if data_limite and data_fine:
-        filtri_attivi.append(f"Pubblicati dal {data_limite} al {data_fine}")
-    elif data_limite:
-        filtri_attivi.append(f"Pubblicati dal: '{data_limite}'")
-    elif data_fine:
-        filtri_attivi.append(f"Pubblicati fino al: '{data_fine}'")
-
-    print("\n[+] Avvio ricerca sul sito...")
-    if filtri_attivi:
-        print("  Filtri applicati:")
-        for f in filtri_attivi: print(f"    -> {f}")
-    else:
-        print("  Nessun filtro specifico inserito (mostro tutti i bandi)")
 
     url_ricerca = genera_url_con_filtri(
         parola_chiave=parola_chiave, cig=cig, stato=codice_stato,
@@ -281,16 +224,7 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
 
     elenco_link = estrai_lista_bandi(url_ricerca, data_limite=data_limite, data_fine=data_fine)
 
-    print(f"\n[+] Trovati {len(elenco_link)} bandi corrispondenti ai filtri e alle date.")
-    print("[+] Avvio estrazione dettagli dalle singole pagine...\n")
-
     lista_risultati = []
-    # Grafie sotto cui l'operatore cercato e' gia' stato visto CON il suo
-    # codice: si costruiscono man mano, dai PDF letti durante questa stessa
-    # scansione. Servono a riconoscerlo anche nei bandi che elencano gli
-    # invitati senza alcun identificativo.
-    # Conteggio dei bandi in cui l'operatore cercato e' stato trovato.
-    _trovati_1a = {}
     contatore_falliti = 0
     # CIG effettivamente interrogati su ANAC: serve a distinguere un guasto del
     # servizio (falliscono TUTTI) da singole gare non pubblicate (ne fallisce
@@ -303,7 +237,6 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
         # chiamata ANAC o di una scrittura). Il bando in corso non viene
         # ripreso e, per scelta, NON si salva nulla del lavoro parziale.
         if deve_fermarsi is not None and deve_fermarsi():
-            print(f"\n[!] Ricerca interrotta dall'utente dopo {i - 1} bandi. Nessun file prodotto.")
             return
         # Avanzamento: annuncia il bando che si sta elaborando ORA ("bando i di
         # N"). Si segnala all'inizio, cosi' la barra dice cosa e' in corso: parte
@@ -314,31 +247,21 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
             time.sleep(2)
 
         url_completo = f"{BASE_URL}{link}" if not link.startswith("http") else link
-        print(f"[{i}] Analizzo: {url_completo}")
 
         dati_bando = estrai_dettagli_bando(url_completo)
-
-        print(f"    -> Tipologia Gara: {dati_bando['tipologia']}")
-        print(f"    -> Scelta Contraente: {dati_bando['scelta_contraente']}")
-        print(f"    -> Ente/Comune: {dati_bando['enti']}")
-        print(f"    -> Pubblicato il: {dati_bando['data_pubblicazione']}")
-        print(f"    -> Scadenza Manif. Interesse: {dati_bando['scadenza_manifestazione']}")
-        print(f"    -> Scadenza Gara: {dati_bando['data_scadenza']}")
 
         lista_cig = dati_bando.get("cig_list", [])
         # Alfabeto italiano completo (21 lettere, senza J K W X Y) — fix bando con 13 CIG (IndexError)
         lettere_lotti = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'L', 'M', 'N',
                          'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'Z']
 
-        print(f"    [..] Ricerca PDF esito...")
         lista_pdf = estrai_link_pdf_esito(url_completo)
-        dati_pdf_comuni = None
 
         # — FILTRO PER P.IVA DELL'INVITATO —
         # La P.IVA degli invitati esiste SOLO dentro i PDF: non e' un filtro
         # del sito ne' un dato ANAC, quindi i PDF vanno comunque scaricati e
-        # letti. Il controllo si fa pero' QUI, prima di stampare e soprattutto
-        # prima di interrogare ANAC: per i bandi che non interessano si
+        # letti. Il controllo si fa pero' QUI, prima di interrogare ANAC:
+        # per i bandi che non interessano si
         # risparmiano tutte le chiamate al servizio (con la verifica Mosparo
         # attiva sono cinque richieste HTTP per ogni CIG).
         if piva_invitato:
@@ -363,122 +286,26 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                 # qualcosa che il documento non dice. Meglio perdere i bandi che
                 # non dichiarano il codice — una riga mancante e' visibile e
                 # onesta, una riga sbagliata no.
-                print(f"    [~] Operatore {piva_invitato} non presente fra gli invitati: bando saltato.\n")
                 continue
-            _trovati_1a["piva"] = _trovati_1a.get("piva", 0) + 1
-            print(f"    [+] TROVATO fra gli invitati: {_match['nome']}"
-                  f" (P.IVA: {_match.get('piva', 'Non presente')}"
-                  + (f", C.F.: {_match['cf']}" if _match.get('cf', 'Non presente') not in
-                                                  ('Non presente', _match.get('piva')) else "") + ")")
-
-        if lista_pdf:
-            print(f"    [+] PDF trovati: {len(lista_pdf)}")
-            for pdf_url in lista_pdf:
-                print(f"        -> {pdf_url}")
-            if len(lista_pdf) == 1:
-                # UN solo PDF: manifestanti/invitati sono davvero comuni alla gara
-                # (anche nei multi-lotto interni, dove i lotti dividono solo le offerte)
-                dati_pdf_comuni = estrai_dati_pdf_esito(lista_pdf[0])
-
-                # Manifestanti comuni (saltati se i lotti hanno i PROPRI:
-                # verranno stampati dentro ogni sezione [CIG: ...])
-                _manif_nei_lotti = any(l.get("num_manifestanti", "Non presente") != "Non presente"
-                                       for l in dati_pdf_comuni.get("lotti", []))
-                if dati_pdf_comuni["num_operatori_manifestanti"] != "Non presente" and not _manif_nei_lotti:
-                    _stampa_lista_operatori(dati_pdf_comuni["operatori_manifestanti"],
-                                            dati_pdf_comuni['num_operatori_manifestanti'],
-                                            "Operatori manifestanti", piva_invitato)
-
-                # Invitati comuni (saltati se propagati ai lotti: verranno
-                # stampati dentro ogni sezione [CIG: ...], senza duplicare)
-                _inv_nei_lotti = any(l.get("num_invitati", "Non presente") != "Non presente"
-                                     for l in dati_pdf_comuni.get("lotti", []))
-                if dati_pdf_comuni["num_operatori_invitati"] != "Non presente" and not _inv_nei_lotti:
-                    _stampa_lista_operatori(dati_pdf_comuni["operatori_invitati"],
-                                            dati_pdf_comuni['num_operatori_invitati'],
-                                            "Operatori invitati", piva_invitato)
-            else:
-                # PIU' PDF (un PDF per lotto): ogni PDF ha i SUOI manifestanti e
-                # invitati (es. gara SP17/SP24: 134 nel Lotto A, 136 nel Lotto B),
-                # quindi niente blocco comune: si stampano dentro ogni sezione
-                # [CIG: ...] dal PDF agganciato a quel CIG. Si evita anche
-                # un'estrazione doppia del primo PDF (ci pensa la cache del loop).
-                print(f"        -> Manifestanti, invitati e offerte stampati per lotto (un PDF per lotto)")
-        else:
-            print(f"    -> Nessun PDF esito trovato.")
 
         if not lista_cig:
-            print("    -> CIG: Non trovato")
             dati_pdf = {}
             if lista_pdf:
                 dati_pdf = estrai_dati_pdf_esito(lista_pdf[0], lotto_corrente=None)
-                # Il CIG puo' mancare in pagina ma esserci nel PDF: stamparlo qui
-                # lo recupera comunque (utile per identificare la gara)
-                print(f"        -> [PDF] CIG dichiarato nel PDF: {dati_pdf.get('cig_pdf', 'Non presente')}")
-                for lotto in dati_pdf["lotti"]:
-                    # Etichetta del lotto: senza questa, con piu' lotti i blocchi
-                    # stampati di seguito non erano attribuibili (Esito-205/208,
-                    # 9 lotti, gara senza alcun CIG ne' in pagina ne' nel PDF).
-                    if lotto.get("nome_lotto"):
-                        print(f"        -> [PDF] {lotto['nome_lotto']}:")
-                    if lotto.get("cig_lotto", "Non presente") != "Non presente":
-                        print(f"        -> [PDF] CIG del lotto: {lotto['cig_lotto']}")
-
-                    # Manifestanti e invitati PER LOTTO: il ramo senza CIG non li
-                    # stampava affatto (li stampava solo il ramo con CIG, riga ~392),
-                    # per cui nei multi-lotto sembravano mancanti pur essendo estratti.
-                    if lotto.get("num_manifestanti", "Non presente") != "Non presente":
-                        _stampa_lista_operatori(lotto.get("manifestanti", []), lotto['num_manifestanti'],
-                                                "Manifestanti", piva_invitato)
-
-                    if lotto.get("num_invitati", "Non presente") != "Non presente":
-                        _stampa_lista_operatori(lotto.get("invitati", []), lotto['num_invitati'],
-                                                "Invitati", piva_invitato)
-
-                    if lotto["num_offerte_ricevute"] != "Non presente":
-                        print(f"        -> [PDF] Offerte ricevute: {lotto['num_offerte_ricevute']}")
-                        for j, o in enumerate(lotto["offerte_ricevute"], 1):
-                            print(f"            {j}. {o}")
-                    if lotto["num_offerte_ammesse"] != "Non presente":
-                        print(f"        -> [PDF] Offerte ammesse: {lotto['num_offerte_ammesse']}")
-                        for j, o in enumerate(lotto.get("offerte_ammesse", []), 1):
-                            print(f"            {j}. {o}")
-                    if lotto["aggiudicatario_pdf"] != "Non presente":
-                        print(f"        -> [PDF] Aggiudicatario: {lotto['aggiudicatario_pdf']}")
-                    if lotto["aggiudicatario_piva"] != "Non presente":
-                        print(f"        -> [PDF] P.IVA: {lotto['aggiudicatario_piva']}")
-                    # C.F. mostrato solo se aggiunge informazione (diverso dalla P.IVA)
-                    if (lotto.get("aggiudicatario_cf", "Non presente") != "Non presente"
-                            and lotto["aggiudicatario_cf"] != lotto.get("aggiudicatario_piva")):
-                        print(f"        -> [PDF] C.F.: {lotto['aggiudicatario_cf']}")
-                    if lotto["ribasso"] != "Non presente":
-                        print(f"        -> [PDF] Ribasso: {lotto['ribasso']}")
-                    if lotto["valore_offerta"] != "Non presente":
-                        print(f"        -> [PDF] Valore offerta: {lotto['valore_offerta']}")
 
             # Risoluzione del CIG (pagina -> PDF -> "Non trovato"): la logica
             # sta in scraper_pdf.risolvi_cig, riusabile da qualunque frontend.
             cig_effettivo = risolvi_cig(None, dati_pdf)
             dati_anac = {}
             if cig_effettivo != "Non trovato":
-                print(f"        -> CIG recuperato dal PDF, usato come CIG della gara: {cig_effettivo}")
                 # ANAC con il CIG recuperato dal PDF: stessa struttura del blocco
                 # (oggi commentato) del loop multi-CIG, cosi' alla riattivazione
                 # di quello i due rami restano gemelli.
-                print(f"    [..] Recupero dati ANAC per CIG {cig_effettivo}...")
                 contatore_anac_tentati += 1
                 json_anac = scarica_json_anac(cig_effettivo)
                 if json_anac:
                     dati_anac = estrai_dati_json_anac(json_anac)
-                    print(f"        -> [ANAC] Numero Gara: {dati_anac['numero_gara']}")
-                    print(f"        -> [ANAC] Oggetto Gara: {dati_anac['oggetto_gara']}")
-                    print(f"        -> [ANAC] CUP: {dati_anac['cup']}")
-                    print(f"        -> [ANAC] CPV: {dati_anac['cod_cpv']} - {dati_anac['descrizione_cpv']}")
-                    print(f"        -> [ANAC] Tipo Scelta Contraente: {dati_anac['tipo_scelta_contraente']}")
-                    print(
-                        f"        -> [ANAC] Aggiudicatario: {dati_anac['aggiudicatario']} (CF: {dati_anac['aggiudicatario_cf']})")
                 else:
-                    print("        -> [ANAC] Impossibile recuperare i dati.")
                     contatore_falliti += 1
             lista_risultati.append({
                 "provincia": dati_bando,
@@ -487,8 +314,6 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                 "pdf": dati_pdf
             })
         else:
-            print(f"    -> CIG trovati: {len(lista_cig)} -> {', '.join(lista_cig)}")
-
             # Cache delle estrazioni PDF: con l'aggancio CIG->PDF per contenuto
             # ogni PDF puo' dover essere letto per capire a quale CIG appartiene;
             # la cache evita di scaricare/estrarre due volte lo stesso PDF quando
@@ -498,28 +323,9 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
             # IL PDF COMANDA, LA PAGINA INTEGRA: la lista dei CIG da processare
             # viene ricostruita dai CIG dichiarati nei PDF (per-lotto o testata),
             # cosi' TUTTI i lotti escono anche se la pagina espone CIG monchi o
-            # mancanti; la lista di pagina resta il fallback per i PDF muti e i
-            # suoi CIG non riscontrati nei PDF vengono solo segnalati.
+            # mancanti; la lista di pagina resta il fallback per i PDF muti.
             _cig_pagina = list(lista_cig)
-            lista_cig, _cig_non_riscontrati, _cig_integrati, _cig_scartati, _cig_divergenti = costruisci_lista_cig(
-                _cig_pagina, lista_pdf, cache=_cache_pdf, con_divergenti=True)
-            if lista_cig != _cig_pagina:
-                print(f"    -> CIG effettivi (pagina + PDF): {len(lista_cig)} -> {', '.join(lista_cig)}")
-            for _c in _cig_integrati:
-                print(f"    [+] CIG integrato dal PDF (assente in pagina): {_c}")
-            for _c in _cig_non_riscontrati:
-                print(f"    [!] CIG di pagina non riscontrato nei PDF (possibile refuso o incoerenza): {_c}")
-            for _c in _cig_scartati:
-                print(
-                    f"    [!] CIG di pagina NON VALIDO ({len(_c)} caratteri, nessun PDF lo completa): {_c} — scartato")
-            # Gara mono-lotto con UN solo PDF che dichiara un CIG DIVERSO da
-            # quello di pagina: non e' un lotto in piu' da processare, e'
-            # un'incoerenza fra le due fonti. Si usa quello di pagina (valido
-            # per ANAC) e si segnala l'altro, senza iterare due volte.
-            for _c in _cig_divergenti:
-                print(f"    [!] Il PDF dichiara {_c}, diverso dal CIG di pagina "
-                      f"{', '.join(_cig_pagina) if _cig_pagina else 'assente'}: "
-                      f"si usa quello di pagina (gara mono-lotto)")
+            lista_cig = costruisci_lista_cig(_cig_pagina, lista_pdf, cache=_cache_pdf)[0]
 
             if not lista_cig and lista_pdf:
                 # Tutti i CIG di pagina scartati e nessun CIG dichiarato nei PDF:
@@ -527,7 +333,6 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                 # comunque la guardia sulla lunghezza), NON per l'estrazione dei
                 # dati. "N.A." e' il segnaposto storico del progetto per il CIG
                 # mancante.
-                print("    [!] Nessun CIG valido disponibile: processo comunque il PDF (CIG = N.A., niente ANAC)")
                 lista_cig = ["N.A."]
 
             for idx, cig_singolo in enumerate(lista_cig):
@@ -542,8 +347,6 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                 else:
                     lotto_corrente = None
 
-                print(f"\n    [CIG: {cig_singolo}]")
-
                 dati_pdf = {}
                 if lista_pdf:
                     if len(lista_pdf) > 1:
@@ -555,8 +358,7 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                         else:
                             # idx oltre i PDF disponibili e nessun CIG dichiarato combacia:
                             # comportamento precedente (PDF unico indicizzato per lotto)
-                            dati_pdf = estrai_dati_pdf_esito(lista_pdf[0],
-                                                             indice_lotto=idx if len(lista_cig) > 1 else None)
+                            dati_pdf = estrai_dati_pdf_esito(lista_pdf[0], indice_lotto=idx if len(lista_cig) > 1 else None)
                     else:
                         # PDF unico: se il costruttore della lista CIG lo ha gia'
                         # estratto (cache) e i lotti dichiarano i loro CIG, si riusa
@@ -568,21 +370,20 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                                 for l in _dati_cache.get("lotti", [])):
                             dati_pdf = _dati_cache
                         else:
-                            dati_pdf = estrai_dati_pdf_esito(lista_pdf[0],
-                                                             indice_lotto=idx if len(lista_cig) > 1 else None)
+                            dati_pdf = estrai_dati_pdf_esito(lista_pdf[0], indice_lotto=idx if len(lista_cig) > 1 else None)
 
                     # Formato multi_lotto_std: un PDF, piu' lotti ognuno col suo CIG.
                     # Si restringe al SOLO lotto di questo CIG (aggancio per contenuto
-                    # via cig_lotto, fallback posizionale) cosi' stampa ed Excel
-                    # portano i dati giusti — la logica sta in scraper_pdf.
+                    # via cig_lotto, fallback posizionale) cosi' l'Excel porta
+                    # i dati giusti — la logica sta in scraper_pdf.
                     _ha_cig_lotto = any(l.get("cig_lotto", "Non presente") != "Non presente"
                                         for l in dati_pdf.get("lotti", []))
                     # Restrizione anche SENZA cig_lotto: se il PDF e' unico e i
                     # suoi lotti sono tanti quanti i CIG di pagina, l'ordine dei
                     # lotti nel PDF corrisponde a quello dei CIG (Esito_F-2/F-3:
                     # 2 CIG in pagina, "Lotto 1 campi sportivi - Lotto 2
-                    # palazzetto"). Senza questo ogni CIG stampava TUTTI i lotti,
-                    # duplicando l'intero blocco a ogni giro del ciclo.
+                    # palazzetto"). Senza questo ogni CIG si sarebbe portato
+                    # dietro TUTTI i lotti, duplicandoli a ogni giro del ciclo.
                     _posizionale = (not _ha_cig_lotto
                                     and len(lista_pdf) == 1
                                     and len(lista_cig) > 1
@@ -598,91 +399,16 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                             dati_pdf = {**dati_pdf, "lotti": [_lotto_sel],
                                         "_totale_lotti": len(dati_pdf.get("lotti", []))}
 
-                    # CIG dichiarato in testata del PDF: stampato PRIMA degli altri
-                    # dati, cosi' e' subito verificabile a occhio l'aggancio CIG->PDF.
-                    # (Nel multi_lotto_std lo sostituisce il CIG del lotto, stampato
-                    # nel blocco del lotto: quello di testata sarebbe sempre il primo.)
-                    _cig_pdf = dati_pdf.get("cig_pdf", "Non presente")
-                    if not _ha_cig_lotto:
-                        print(f"        -> [PDF] CIG dichiarato nel PDF: {_cig_pdf}")
-                    if (len(lista_pdf) > 1 and _cig_pdf != "Non presente"
-                            and _cig_pdf.upper() != cig_singolo.upper()):
-                        # Puo' accadere solo col fallback posizionale: il PDF preso
-                        # per indice dichiara un CIG DIVERSO da quello cercato.
-                        print(f"        [!] ATTENZIONE: il PDF dichiara {_cig_pdf}, "
-                              f"diverso dal CIG cercato {cig_singolo} (aggancio posizionale)")
-
-                    if len(lista_pdf) > 1:
-                        # Un PDF per lotto: manifestanti e invitati appartengono a
-                        # QUESTO lotto e si stampano nella sua sezione [CIG: ...]
-                        if dati_pdf.get("num_operatori_manifestanti", "Non presente") != "Non presente":
-                            _stampa_lista_operatori(dati_pdf["operatori_manifestanti"],
-                                                    dati_pdf['num_operatori_manifestanti'],
-                                                    "Operatori manifestanti", piva_invitato)
-                        if dati_pdf.get("num_operatori_invitati", "Non presente") != "Non presente":
-                            _stampa_lista_operatori(dati_pdf["operatori_invitati"], dati_pdf['num_operatori_invitati'],
-                                                    "Operatori invitati", piva_invitato)
-
-                    for lotto in dati_pdf["lotti"]:
-                        if lotto["nome_lotto"]:
-                            print(f"        -> [PDF] {lotto['nome_lotto']}:")
-                        if lotto.get("cig_lotto", "Non presente") != "Non presente":
-                            print(f"        -> [PDF] CIG del lotto: {lotto['cig_lotto']}")
-
-                        # Manifestanti per lotto
-                        if "num_manifestanti" in lotto and lotto["num_manifestanti"] != "Non presente":
-                            _stampa_lista_operatori(lotto.get("manifestanti", []), lotto["num_manifestanti"],
-                                                    "Manifestanti", piva_invitato)
-
-                        # Invitati per lotto
-                        if "num_invitati" in lotto and lotto["num_invitati"] != "Non presente":
-                            _stampa_lista_operatori(lotto.get("invitati", []), lotto["num_invitati"],
-                                                    "Invitati", piva_invitato)
-
-                        if piva_invitato:
-                            continue
-                        if lotto["num_offerte_ricevute"] != "Non presente":
-                            print(f"        -> [PDF] Offerte ricevute: {lotto['num_offerte_ricevute']}")
-                            for j, o in enumerate(lotto["offerte_ricevute"], 1):
-                                print(f"            {j}. {o}")
-                        if lotto["num_offerte_ammesse"] != "Non presente":
-                            print(f"        -> [PDF] Offerte ammesse: {lotto['num_offerte_ammesse']}")
-                            for j, o in enumerate(lotto.get("offerte_ammesse", []), 1):
-                                print(f"            {j}. {o}")
-                        if lotto["num_offerte_escluse"] != "Non presente":
-                            print(f"        -> [PDF] Offerte escluse: {lotto['num_offerte_escluse']}")
-                        if lotto["aggiudicatario_pdf"] != "Non presente":
-                            print(f"        -> [PDF] Aggiudicatario: {lotto['aggiudicatario_pdf']}")
-                        if lotto["aggiudicatario_piva"] != "Non presente":
-                            print(f"        -> [PDF] P.IVA: {lotto['aggiudicatario_piva']}")
-                        if (lotto.get("aggiudicatario_cf", "Non presente") != "Non presente"
-                                and lotto["aggiudicatario_cf"] != lotto.get("aggiudicatario_piva")):
-                            print(f"        -> [PDF] C.F.: {lotto['aggiudicatario_cf']}")
-                        if lotto["ribasso"] != "Non presente":
-                            print(f"        -> [PDF] Ribasso: {lotto['ribasso']}")
-                        if lotto["valore_offerta"] != "Non presente":
-                            print(f"        -> [PDF] Valore offerta: {lotto['valore_offerta']}")
-
                 # Dati ANAC
                 dati_anac = {}
                 if cig_singolo.upper() == "N.A.":
-                    print(f"    -> CIG non disponibile, dati ANAC non recuperabili.")
                     contatore_falliti += 1
                 else:
-                    print(f"    [..] Recupero dati ANAC per CIG {cig_singolo}...")
                     contatore_anac_tentati += 1
                     json_anac = scarica_json_anac(cig_singolo)
                     if json_anac:
                         dati_anac = estrai_dati_json_anac(json_anac)
-                        print(f"        -> [ANAC] Numero Gara: {dati_anac['numero_gara']}")
-                        print(f"        -> [ANAC] Oggetto Gara: {dati_anac['oggetto_gara']}")
-                        print(f"        -> [ANAC] CUP: {dati_anac['cup']}")
-                        print(f"        -> [ANAC] CPV: {dati_anac['cod_cpv']} - {dati_anac['descrizione_cpv']}")
-                        print(f"        -> [ANAC] Tipo Scelta Contraente: {dati_anac['tipo_scelta_contraente']}")
-                        print(
-                            f"        -> [ANAC] Aggiudicatario: {dati_anac['aggiudicatario']} (CF: {dati_anac['aggiudicatario_cf']})")
                     else:
-                        print("        -> [ANAC] Impossibile recuperare i dati.")
                         contatore_falliti += 1
 
                 lista_risultati.append({
@@ -694,24 +420,8 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
 
                 time.sleep(2)
 
-        print("-" * 60)
-
-    # — RIEPILOGO DELLA RICERCA PER OPERATORE —
-    if piva_invitato:
-        _n_piva = _trovati_1a.get("piva", 0)
-        print("\n" + "=" * 60)
-        print(f"[=] RICERCA OPERATORE {piva_invitato} — RIEPILOGO")
-        print(f"    bandi analizzati     : {len(elenco_link)}")
-        print(f"    TROVATI              : {_n_piva}")
-        print(f"    senza corrispondenza : {len(elenco_link) - _n_piva}")
-        print("    NOTA: il riconoscimento avviene solo sul codice dichiarato nel PDF.")
-        print("          I bandi che elencano gli invitati senza P.IVA ne' C.F. non")
-        print("          possono essere ricondotti a un operatore e restano esclusi.")
-        print("=" * 60)
-
     if lista_risultati:
         salva_in_excel(lista_risultati, nome_file=nome_file, piva_invitato=piva_invitato)
-        print(f"\n[!] CIG senza dati ANAC: {contatore_falliti}")
 
     # Bilancio ANAC per il chiamante: se sono stati tentati dei CIG e sono
     # falliti TUTTI, il servizio era verosimilmente irraggiungibile; se ne e'
@@ -779,6 +489,15 @@ class BandiPistoiaApp(QMainWindow):
         # (che lavora in background) al thread della GUI (che gestisce la grafica).
 
         self._ricerca_in_corso = False  # Variabile booleana per sapere se c'è un'elaborazione attiva in questo momento
+
+        # Cartella di destinazione scelta dall'utente; None = destinazione
+        # predefinita. Il percorso NON si ricava dal testo dell'etichetta:
+        # quel testo e' un'informazione per l'occhio, non un dato del programma.
+        self._cartella_scelta = None
+        self._cartella_predefinita = cartella_download()
+        self._etichetta_predefinita = ("Cartella Download (default)"
+                                       if self._cartella_predefinita
+                                       else "Cartella del progetto (default)")
 
         # Crea un Timer. Questo timer scatterà a intervalli regolari (es. ogni 100ms)
         # e chiamerà la funzione `_controlla_coda` per vedere se lo scraper ha inviato nuovi messaggi
@@ -1295,7 +1014,7 @@ class BandiPistoiaApp(QMainWindow):
         lbl_dest.setStyleSheet("font-weight: bold; color: #4e5d6c;")
         riga_cartella.addWidget(lbl_dest)
 
-        self.label_cartella = QLabel("Cartella del progetto (Default)")
+        self.label_cartella = QLabel(self._etichetta_predefinita)
         self.label_cartella.setStyleSheet("color: #7f8c8d; font-style: italic;")
         self.label_cartella.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         riga_cartella.addWidget(self.label_cartella)
@@ -1331,6 +1050,7 @@ class BandiPistoiaApp(QMainWindow):
                                                     "Scegli cartella di destinazione")  # apre la finestra standard per scegliere una cartella, restituisce una stringa con il percorso
         # Se è stata scelta una cartella (la stringa non è vuota)
         if cartella:
+            self._cartella_scelta = cartella  # memorizza la scelta: e' questo il dato usato al salvataggio
             self.label_cartella.setText(cartella)  # Aggiorna il testo dell'etichetta mostrando il percorso reale
             self.label_cartella.setStyleSheet("color: #2c3e50; font-style: normal; font-weight: 500;")
 
@@ -1407,7 +1127,8 @@ class BandiPistoiaApp(QMainWindow):
         self.campo_oggetto.clear()
         self.campo_cig.clear()
         self.campo_nome_file.clear()
-        self.label_cartella.setText("Cartella del progetto (default)")
+        self._cartella_scelta = None
+        self.label_cartella.setText(self._etichetta_predefinita)
         self.label_cartella.setStyleSheet("color: #7f8c8d; font-style: italic;")
         self.menu_stato.setCurrentIndex(0)
         self.menu_tipologia.setCurrentIndex(0)
@@ -1452,8 +1173,11 @@ class BandiPistoiaApp(QMainWindow):
         if not nome.endswith(".xlsx"):
             nome += ".xlsx"
 
-        cartella = self.label_cartella.text()  # recupera il percorso della cartella scelta
-        percorso = nome if cartella == "Cartella del progetto (default)" else f"{cartella}/{nome}"  # Crea il percorso finale
+        # Percorso finale: la cartella scelta dall'utente, altrimenti quella
+        # predefinita (Download). os.path.join mette il separatore giusto per il
+        # sistema operativo, e con destinazione vuota lascia il solo nome file,
+        # cioe' la cartella del progetto.
+        percorso = os.path.join(self._cartella_scelta or self._cartella_predefinita, nome)
 
         # Lancia la funzione che avvia lo scraping, passando il percorso in cui salvare
         self._avvia_ricerca(percorso)

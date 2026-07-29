@@ -2,6 +2,7 @@ import re
 import io
 import requests
 import pdfplumber
+from console import log  # stampa solo se console.VERBOSE e' acceso
 
 
 # ── Costanti globali ──────────────────────────────────────────────────────────
@@ -3522,7 +3523,7 @@ def estrai_link_pdf_esito(url_bando, BASE_URL="https://www.provincia.pistoia.it"
         return pdf_trovati
 
     except Exception as e:
-        print(f"[-] Errore ricerca PDF nel bando {url_bando}: {e}")
+        log(f"[-] Errore ricerca PDF nel bando {url_bando}: {e}")
         return []
 
 
@@ -3696,7 +3697,7 @@ def estrai_dati_pdf_esito(url_pdf, lotto_corrente=None, indice_lotto=None):
     try:
         risposta = requests.get(url_pdf, timeout=15)
         if risposta.status_code != 200:
-            print(f"[-] Impossibile scaricare il PDF: {url_pdf}")
+            log(f"[-] Impossibile scaricare il PDF: {url_pdf}")
             return dati_pdf
 
         with pdfplumber.open(io.BytesIO(risposta.content)) as pdf:
@@ -3711,8 +3712,8 @@ def estrai_dati_pdf_esito(url_pdf, lotto_corrente=None, indice_lotto=None):
         # estrarre nulla e tutti i campi resterebbero vuoti in silenzio. Lo segnala
         # esplicitamente e si ferma (es. bando impianti sportivi Ponte Buggianese 2017).
         if len(testo.strip()) < 50 and n_immagini > 0:
-            print(f"    [!] PDF scannerizzato (immagine, nessun testo estraibile): {url_pdf}")
-            print(f"        -> dati non estraibili senza OCR; campi lasciati a 'Non presente'")
+            log(f"    [!] PDF scannerizzato (immagine, nessun testo estraibile): {url_pdf}")
+            log(f"        -> dati non estraibili senza OCR; campi lasciati a 'Non presente'")
             dati_pdf["pdf_scansionato"] = True
             return dati_pdf
 
@@ -3721,7 +3722,6 @@ def estrai_dati_pdf_esito(url_pdf, lotto_corrente=None, indice_lotto=None):
         testo = testo.replace('“', '"').replace('”', '"')
 
         formato = rileva_formato_pdf(testo)
-        print(f"DEBUG formato rilevato: {formato}")
 
         # — CIG dichiarato nel PDF —
         # Serve a main.py per agganciare CIG→PDF per CONTENUTO (bandi multi-lotto
@@ -3850,7 +3850,7 @@ def estrai_dati_pdf_esito(url_pdf, lotto_corrente=None, indice_lotto=None):
             _lotto["aggiudicatario_cf"] = _cf_da_riga(_riga_agg, _pv)
 
     except Exception as e:
-        print(f"[-] Errore estrazione dati PDF {url_pdf}: {e}")
+        log(f"[-] Errore estrazione dati PDF {url_pdf}: {e}")
 
     return dati_pdf
 

@@ -1,4 +1,3 @@
-#introduco il filtro per partita iva
 import requests
 from bs4 import BeautifulSoup
 import urllib.parse  # Serve per gestire correttamente gli spazi e i caratteri speciali nei filtri
@@ -8,6 +7,7 @@ import hashlib
 import pdfplumber
 import io
 import re
+from console import log  # stampa solo se console.VERBOSE e' acceso
 
 BASE_URL = "https://www.provincia.pistoia.it"
 
@@ -42,12 +42,12 @@ def estrai_lista_bandi(url_con_filtri, data_limite=None, data_fine=None):
     # CICLO PRINCIPALE
     while True:
         url_pagina = f"{url_con_filtri}&page={pagina_corrente}"  # scorre le pagine contenenti i bandi partendo da pag0
-        print(f"Richiedo pagina {pagina_corrente + 1}: {url_pagina}\n")
+        log(f"Richiedo pagina {pagina_corrente + 1}: {url_pagina}\n")
 
         risposta = requests.get(
             url_pagina)  # Verifica la disponibilità/funzionamento del server, se da errore interrompiamo subito
         if risposta.status_code != 200:
-            print(f"Errore di connessione. Codice: {risposta.status_code}")
+            log(f"Errore di connessione. Codice: {risposta.status_code}")
             break
 
         # Tasforma l'HTML in un oggetto navigabile e cerca la tabella dei risultati
@@ -55,7 +55,7 @@ def estrai_lista_bandi(url_con_filtri, data_limite=None, data_fine=None):
         soup = BeautifulSoup(risposta.text, 'html.parser')
         tabella = soup.find('table')
         if not tabella:
-            print("Nessun bando trovato (tabella vuota).")
+            log("Nessun bando trovato (tabella vuota).")
             break
 
         righe = tabella.find_all('tr')  # prende tutte le righe della tabella, inclusa l'intestazione
@@ -90,7 +90,7 @@ def estrai_lista_bandi(url_con_filtri, data_limite=None, data_fine=None):
                 if tag_tempo and tag_tempo.get('datetime'):
                     data_bando = tag_tempo['datetime'].split('T')[0]
                     if data_limite and data_bando < data_limite:
-                        print(f"  [!] Bando del {data_bando} precedente alla data di inizio. Stop.")
+                        log(f"  [!] Bando del {data_bando} precedente alla data di inizio. Stop.")
                         stop_per_data = True
                         break
                     if data_fine and data_bando > data_fine:
@@ -113,13 +113,13 @@ def estrai_lista_bandi(url_con_filtri, data_limite=None, data_fine=None):
 
         if stop_per_data or not ha_pagina_dopo:  # se abbiamo trovato un bando troppo vecchio o non ha pagina dopo usciamo dal while
             if not stop_per_data:  # se non abbiamo trovato un bando troppo vecchio
-                print(f"  [✓] Ultima pagina raggiunta (pagina {pagina_corrente + 1}).")
+                log(f"  [✓] Ultima pagina raggiunta (pagina {pagina_corrente + 1}).")
             break
 
         pagina_corrente += 1  # altrimenti incrementiamo il numero di pagina e passiamo alla pagina dopo
         time.sleep(1)
 
-    print(f"\n[+] Totale link raccolti: {len(link_bandi)}")  # stampa il totale di link raccolti
+    log(f"\n[+] Totale link raccolti: {len(link_bandi)}")  # stampa il totale di link raccolti
     return link_bandi  # ritorna i link raccolti
 
 
@@ -142,7 +142,7 @@ def estrai_dettagli_bando(url_bando):
     try:
         risposta = requests.get(url_bando, timeout=10)  # se il server non risonde entro 10 secondi lancia un'eccezione
         if risposta.status_code != 200:
-            print(f"[-] Impossibile accedere: {url_bando}")
+            log(f"[-] Impossibile accedere: {url_bando}")
             return dati_bando  # se in risposta arriva un codice diverso da 200, ritorna i dati standard
 
         # Tasforma l'HTML in un oggetto navigabile
@@ -220,7 +220,7 @@ def estrai_dettagli_bando(url_bando):
             dati_bando["data_scadenza"] = div_scad.find('time')['datetime'].split('T')[0]
 
     except Exception as e:  # cattura qualsiasi tipo di errore
-        print(f"[-] Errore durante lo scraping del bando {url_bando}: {e}")
+        log(f"[-] Errore durante lo scraping del bando {url_bando}: {e}")
 
     return dati_bando  # ritorna i dati
 
@@ -442,12 +442,12 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
     # proofOfWorkMaxNumber): su un codice inesistente sarebbe tutto lavoro
     # sprecato, ripetuto per tutti i tentativi.
     if not cig or len(cig) != 10:
-        print(f"    [-] CIG non valido ({len(cig) if cig else 0} caratteri): '{cig}' — salto la chiamata ANAC")
+        log(f"    [-] CIG non valido ({len(cig) if cig else 0} caratteri): '{cig}' — salto la chiamata ANAC")
         return None
 
     for tentativo in range(1, tentativi + 1):  # itera sui tentativi
         if tentativo > 1:  # se non è il primo tentativo fa una pausa, al primo non avrebbe senso
-            print(f"    [!] Tentativo {tentativo}/{tentativi}...")
+            log(f"    [!] Tentativo {tentativo}/{tentativi}...")
             time.sleep(8)
 
         sessione = requests.Session()  # ad ogni tentativo viene creata una nuova sessione
@@ -474,7 +474,7 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
                                            timeout=10)  # json=payload_token invia il dizionario come corpo JSON della richiesta POST (requests lo converte automaticamente e imposta Content-Type: application/json).
             # Controlla se il server ha risposto con un errore (es. 500, 502, 503)
             if not risposta_token.ok:
-                print(f"    [-] Il server ANAC è irraggiungibile o in errore (Status: {risposta_token.status_code})")
+                log(f"    [-] Il server ANAC è irraggiungibile o in errore (Status: {risposta_token.status_code})")
                 # 401/403 allo STEP 1 = il server RIFIUTA la chiave pubblica,
                 # non e' un disservizio passeggero. Ritentare identici altri 14
                 # volte e' inutile: si esce subito spiegando cosa aggiornare.
@@ -486,12 +486,12 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
                     vecchia = ottieni_chiave_mosparo()
                     nuova = ottieni_chiave_mosparo(forza_refresh=True)
                     if nuova != vecchia:
-                        print("    [i] Chiave Mosparo aggiornata da runtime-config.js: ritento.")
+                        log("    [i] Chiave Mosparo aggiornata da runtime-config.js: ritento.")
                         continue
-                    print("    [-] Chiave pubblica Mosparo rifiutata da ANAC.")
-                    print("        La chiave in runtime-config.js e' la stessa gia' usata:")
-                    print("        se il problema persiste, ANAC potrebbe aver cambiato il")
-                    print("        meccanismo di verifica (non solo la chiave).")
+                    log("    [-] Chiave pubblica Mosparo rifiutata da ANAC.")
+                    log("        La chiave in runtime-config.js e' la stessa gia' usata:")
+                    log("        se il problema persiste, ANAC potrebbe aver cambiato il")
+                    log("        meccanismo di verifica (non solo la chiave).")
                     return None
                 continue  # Passa al tentativo successivo senza far crashare il programma
             dati_token = risposta_token.json()  # .json() converte la risposta (testo JSON) in un dizionario Python
@@ -516,7 +516,7 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
                     break  # esce dal ciclo
 
             if proof_number is None:  # Se nessun numero nel range produce l'hash giusto (caso anomalo, non dovrebbe succedere quasi mai), proof_number resta None
-                print(f"    [-] Proof of work non trovato per CIG {cig}")
+                log(f"    [-] Proof of work non trovato per CIG {cig}")
                 continue  # salta al tentativo successivo del ciclo esterno — non ha senso proseguire senza questo numero.
 
             # STEP 3: Validazione form
@@ -543,7 +543,7 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
             dati_check = risposta_check.json()
 
             if not dati_check.get("valid"):  # Se la risposta non contiene "valid": true, la validazione è fallita
-                print(f"    [-] Validazione Mosparo fallita per CIG {cig}")
+                log(f"    [-] Validazione Mosparo fallita per CIG {cig}")
                 continue  # si passa al tentativo successivo
 
             validation_token = dati_check[
@@ -566,14 +566,14 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
                 return dati[0] if isinstance(dati, list) and len(
                     dati) > 0 else dati  # isinstance(dati, list) and len(dati) > 0 controlla: è una lista e non è vuota? Se sì, restituiamo il primo elemento (dati[0]) — l'API restituisce i dati del CIG dentro una lista con un solo elemento, quindi "scartiamo" il livello lista esterno, se non è una lista (o è vuota), restituiamo dati così com'è
             else:  # Se invece lo status non è 200, stampiamo l'errore e continue al tentativo successivo.
-                print(f"    [-] API CIG ha risposto con codice: {risposta_cig.status_code}")
+                log(f"    [-] API CIG ha risposto con codice: {risposta_cig.status_code}")
                 continue
 
         except Exception as e:
-            print(
+            log(
                 f"    [-] Errore tentativo {tentativo} per CIG {cig}: {e}")  # Qualsiasi eccezione (timeout, errore di rete, JSON malformato, chiave mancante in dati_token["submitToken"] se la risposta non ha quella struttura) viene catturata qui e stampata, poi il ciclo for continua al tentativo successivo automaticamente
 
-    print(
+    log(
         f"    [-] Tutti i tentativi falliti per CIG {cig}")  # Se tutti i tentativi falliscono (nessun return è stato eseguito), si arriva dopo il for e si restituisce None — che il main interpreta come "impossibile recuperare i dati ANAC".
     return None
 
@@ -603,12 +603,12 @@ def _scarica_json_anac_diretto(cig, tentativi=15, serve_mosparo=None):
     # brucerebbe TUTTI i tentativi (15 x 8s) per nulla. Si rifiuta subito,
     # qualunque sia il chiamante (main, GUI, ...).
     if not cig or len(cig) != 10:
-        print(f"    [-] CIG non valido ({len(cig) if cig else 0} caratteri): '{cig}' — salto la chiamata ANAC")
+        log(f"    [-] CIG non valido ({len(cig) if cig else 0} caratteri): '{cig}' — salto la chiamata ANAC")
         return None
 
     for tentativo in range(1, tentativi + 1):
         if tentativo > 1:
-            print(f"    [!] Tentativo {tentativo}/{tentativi}...")
+            log(f"    [!] Tentativo {tentativo}/{tentativi}...")
             time.sleep(8)
 
         sessione = requests.Session()  # sessione nuova ad ogni tentativo: si parte puliti
@@ -637,7 +637,7 @@ def _scarica_json_anac_diretto(cig, tentativi=15, serve_mosparo=None):
                 except (TypeError, ValueError):
                     attesa = 0
                 attesa = attesa or min(60, 8 * tentativo)
-                print(f"    [-] ANAC limita le richieste (429): attendo {attesa}s")
+                log(f"    [-] ANAC limita le richieste (429): attendo {attesa}s")
                 time.sleep(attesa)
                 continue
 
@@ -646,18 +646,18 @@ def _scarica_json_anac_diretto(cig, tentativi=15, serve_mosparo=None):
             # Si segna il motivo nel flag del chiamante e si esce subito, cosi'
             # il dispatcher sa che deve ripiegare sulla via con verifica.
             if _richiede_mosparo(risposta_cig):
-                print("    [!] ANAC richiede la verifica Mosparo: passo alla via con verifica")
+                log("    [!] ANAC richiede la verifica Mosparo: passo alla via con verifica")
                 if serve_mosparo is not None:
                     serve_mosparo[0] = True
                 return None
 
-            print(f"    [-] API CIG ha risposto con codice: {risposta_cig.status_code}")
+            log(f"    [-] API CIG ha risposto con codice: {risposta_cig.status_code}")
             continue
 
         except Exception as e:
-            print(f"    [-] Errore tentativo {tentativo} per CIG {cig}: {e}")
+            log(f"    [-] Errore tentativo {tentativo} per CIG {cig}: {e}")
 
-    print(f"    [-] Tutti i tentativi falliti per CIG {cig}")
+    log(f"    [-] Tutti i tentativi falliti per CIG {cig}")
     return None
 
 
@@ -779,12 +779,12 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
     # proofOfWorkMaxNumber): su un codice inesistente sarebbe tutto lavoro
     # sprecato, ripetuto per tutti i tentativi.
     if not cig or len(cig) != 10:
-        print(f"    [-] CIG non valido ({len(cig) if cig else 0} caratteri): '{cig}' — salto la chiamata ANAC")
+        log(f"    [-] CIG non valido ({len(cig) if cig else 0} caratteri): '{cig}' — salto la chiamata ANAC")
         return None
 
     for tentativo in range(1, tentativi + 1):  # itera sui tentativi
         if tentativo > 1:  # se non è il primo tentativo fa una pausa, al primo non avrebbe senso
-            print(f"    [!] Tentativo {tentativo}/{tentativi}...")
+            log(f"    [!] Tentativo {tentativo}/{tentativi}...")
             time.sleep(8)
 
         sessione = requests.Session()  # ad ogni tentativo viene creata una nuova sessione
@@ -812,14 +812,14 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
                                            timeout=10)  # json=payload_token invia il dizionario come corpo JSON della richiesta POST (requests lo converte automaticamente e imposta Content-Type: application/json).
             # Controlla se il server ha risposto con un errore (es. 500, 502, 503)
             if not risposta_token.ok:
-                print(f"    [-] Il server ANAC è irraggiungibile o in errore (Status: {risposta_token.status_code})")
+                log(f"    [-] Il server ANAC è irraggiungibile o in errore (Status: {risposta_token.status_code})")
                 # 401/403 allo STEP 1 = il server RIFIUTA la chiave pubblica,
                 # non e' un disservizio passeggero. Ritentare identici altri 14
                 # volte e' inutile: si esce subito spiegando cosa aggiornare.
                 if risposta_token.status_code in (401, 403):
-                    print("    [-] Chiave pubblica Mosparo rifiutata: probabilmente ANAC l'ha cambiata.")
-                    print("        Aggiorna MOSPARO_PUBLIC_KEY leggendola dagli strumenti di sviluppo")
-                    print("        (pagina CIG -> Rete -> request-submit-token -> Payload -> publicKey).")
+                    log("    [-] Chiave pubblica Mosparo rifiutata: probabilmente ANAC l'ha cambiata.")
+                    log("        Aggiorna MOSPARO_PUBLIC_KEY leggendola dagli strumenti di sviluppo")
+                    log("        (pagina CIG -> Rete -> request-submit-token -> Payload -> publicKey).")
                     return None
                 continue  # Passa al tentativo successivo senza far crashare il programma
             dati_token = risposta_token.json()  # .json() converte la risposta (testo JSON) in un dizionario Python
@@ -844,7 +844,7 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
                     break  # esce dal ciclo
 
             if proof_number is None:  # Se nessun numero nel range produce l'hash giusto (caso anomalo, non dovrebbe succedere quasi mai), proof_number resta None
-                print(f"    [-] Proof of work non trovato per CIG {cig}")
+                log(f"    [-] Proof of work non trovato per CIG {cig}")
                 continue  # salta al tentativo successivo del ciclo esterno — non ha senso proseguire senza questo numero.
 
             # STEP 3: Validazione form
@@ -871,7 +871,7 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
             dati_check = risposta_check.json()
 
             if not dati_check.get("valid"):  # Se la risposta non contiene "valid": true, la validazione è fallita
-                print(f"    [-] Validazione Mosparo fallita per CIG {cig}")
+                log(f"    [-] Validazione Mosparo fallita per CIG {cig}")
                 continue  # si passa al tentativo successivo
 
             validation_token = dati_check[
@@ -894,14 +894,14 @@ def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
                 return dati[0] if isinstance(dati, list) and len(
                     dati) > 0 else dati  # isinstance(dati, list) and len(dati) > 0 controlla: è una lista e non è vuota? Se sì, restituiamo il primo elemento (dati[0]) — l'API restituisce i dati del CIG dentro una lista con un solo elemento, quindi "scartiamo" il livello lista esterno, se non è una lista (o è vuota), restituiamo dati così com'è
             else:  # Se invece lo status non è 200, stampiamo l'errore e continue al tentativo successivo.
-                print(f"    [-] API CIG ha risposto con codice: {risposta_cig.status_code}")
+                log(f"    [-] API CIG ha risposto con codice: {risposta_cig.status_code}")
                 continue
 
         except Exception as e:
-            print(
+            log(
                 f"    [-] Errore tentativo {tentativo} per CIG {cig}: {e}")  # Qualsiasi eccezione (timeout, errore di rete, JSON malformato, chiave mancante in dati_token["submitToken"] se la risposta non ha quella struttura) viene catturata qui e stampata, poi il ciclo for continua al tentativo successivo automaticamente
 
-    print(
+    log(
         f"    [-] Tutti i tentativi falliti per CIG {cig}")  # Se tutti i tentativi falliscono (nessun return è stato eseguito), si arriva dopo il for e si restituisce None — che il main interpreta come "impossibile recuperare i dati ANAC".
     return None
 
@@ -931,12 +931,12 @@ def _scarica_json_anac_diretto(cig, tentativi=15, serve_mosparo=None):
     # brucerebbe TUTTI i tentativi (15 x 8s) per nulla. Si rifiuta subito,
     # qualunque sia il chiamante (main, GUI, ...).
     if not cig or len(cig) != 10:
-        print(f"    [-] CIG non valido ({len(cig) if cig else 0} caratteri): '{cig}' — salto la chiamata ANAC")
+        log(f"    [-] CIG non valido ({len(cig) if cig else 0} caratteri): '{cig}' — salto la chiamata ANAC")
         return None
 
     for tentativo in range(1, tentativi + 1):
         if tentativo > 1:
-            print(f"    [!] Tentativo {tentativo}/{tentativi}...")
+            log(f"    [!] Tentativo {tentativo}/{tentativi}...")
             time.sleep(8)
 
         sessione = requests.Session()  # sessione nuova ad ogni tentativo: si parte puliti
@@ -965,7 +965,7 @@ def _scarica_json_anac_diretto(cig, tentativi=15, serve_mosparo=None):
                 except (TypeError, ValueError):
                     attesa = 0
                 attesa = attesa or min(60, 8 * tentativo)
-                print(f"    [-] ANAC limita le richieste (429): attendo {attesa}s")
+                log(f"    [-] ANAC limita le richieste (429): attendo {attesa}s")
                 time.sleep(attesa)
                 continue
 
@@ -974,17 +974,17 @@ def _scarica_json_anac_diretto(cig, tentativi=15, serve_mosparo=None):
             # Si segna il motivo nel flag del chiamante e si esce subito, cosi'
             # il dispatcher sa che deve ripiegare sulla via con verifica.
             if _richiede_mosparo(risposta_cig):
-                print("    [!] ANAC richiede la verifica Mosparo: passo alla via con verifica")
+                log("    [!] ANAC richiede la verifica Mosparo: passo alla via con verifica")
                 if serve_mosparo is not None:
                     serve_mosparo[0] = True
                 return None
 
-            print(f"    [-] API CIG ha risposto con codice: {risposta_cig.status_code}")
+            log(f"    [-] API CIG ha risposto con codice: {risposta_cig.status_code}")
             continue
 
         except Exception as e:
-            print(f"    [-] Errore tentativo {tentativo} per CIG {cig}: {e}")
+            log(f"    [-] Errore tentativo {tentativo} per CIG {cig}: {e}")
 
-    print(f"    [-] Tutti i tentativi falliti per CIG {cig}")
+    log(f"    [-] Tutti i tentativi falliti per CIG {cig}")
     return None
 '''

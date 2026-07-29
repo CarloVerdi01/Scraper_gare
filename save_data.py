@@ -1,8 +1,8 @@
-#introduciamo anche i dati del pdf
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from datetime import datetime
 import re
+from console import log  # stampa solo se console.VERBOSE e' acceso
 
 
 # =====================================================================
@@ -388,5 +388,5 @@ def salva_in_excel(lista_bandi, nome_file=None, piva_invitato=None):
     ws.freeze_panes = "A2"
 
     wb.save(nome_file)
-    print(f"\n[+] File Excel salvato: {nome_file}  ({len(righe)} righe da {len(lista_bandi)} bandi)")
+    log(f"\n[+] File Excel salvato: {nome_file}  ({len(righe)} righe da {len(lista_bandi)} bandi)")
     return nome_file

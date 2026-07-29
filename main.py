@@ -1,10 +1,15 @@
-#introduco il filtro per partita iva
 from pick import pick  # <--- Libreria super leggera per le freccette
 from scraper import genera_url_con_filtri, estrai_lista_bandi, BASE_URL, estrai_dati_json_anac, scarica_json_anac, estrai_dettagli_bando
 from datetime import datetime
 from save_data import salva_in_excel
 import time
 from scraper_pdf import estrai_dati_pdf_esito, estrai_link_pdf_esito, seleziona_pdf_per_cig, seleziona_lotto_per_cig, risolvi_cig, costruisci_lista_cig, cig_compatibile, invitato_con_piva, normalizza_piva
+
+import console
+# Versione da terminale: e' il file usato per il debug, quindi accende i
+# messaggi diagnostici dei moduli condivisi (scraper, scraper_pdf,
+# save_data). gui.py e app.py non lo fanno e restano silenziosi.
+console.VERBOSE = True
 
 
 # =====================================================================
@@ -651,7 +656,7 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
         print("=" * 60)
 
     if lista_risultati:
-        #salva_in_excel(lista_risultati, nome_file=nome_file, piva_invitato=piva_invitato)
+        salva_in_excel(lista_risultati, nome_file=nome_file, piva_invitato=piva_invitato)
         print(f"\n[!] CIG senza dati ANAC: {contatore_falliti}")
 
 # =====================================================================

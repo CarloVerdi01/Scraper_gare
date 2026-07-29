@@ -1,5 +1,17 @@
-requests==2.34.2
-beautifulsoup4==4.14.3
-openpyxl==3.1.5
-pick==2.6.0
+# Dipendenze del progetto "Scraper Bandi Provincia di Pistoia".
+# Installazione:  pip install -r requirements.txt
+
+# --- Nucleo: servono sempre, a qualunque interfaccia ---------------------
+requests==2.34.2          # richieste HTTP al sito della Provincia e all'API ANAC
+beautifulsoup4==4.14.3    # lettura dell'HTML delle pagine dei bandi
+pdfplumber==0.11.10       # estrazione del testo dai PDF di esito
+openpyxl==3.1.5           # scrittura del file Excel finale
+
+# --- Interfaccia grafica desktop (gui.py) -------------------------------
 PyQt6==6.11.0
+
+# --- Interfaccia web (app.py) -------------------------------------------
+Flask==3.1.3
+
+# --- Versione da terminale, usata per il debug (main.py) ----------------
+pick==2.6.0               # menu a freccette; nessun altro file la usa
