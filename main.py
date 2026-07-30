@@ -1,4 +1,28 @@
-from pick import pick  # <--- Libreria super leggera per le freccette
+"""
+Versione da terminale dello scraper: e' quella che si usa per il debug.
+
+Fa esattamente la stessa ricerca della finestra grafica e dell'interfaccia
+web, ma chiede i filtri a domande e menu, e soprattutto e' l'UNICA delle tre
+che parla: accende con console.VERBOSE i messaggi diagnostici dei moduli
+condivisi (tentativi verso ANAC, verifica Mosparo, PDF illeggibili). Quando
+qualcosa non torna, e' da qui che si capisce cosa.
+
+Avvio
+    python main.py
+
+Serve un terminale vero. I menu a freccette usano la libreria pick, che si
+appoggia a curses: in una console che non emula un terminale i menu non
+funzionano. In PyCharm va spuntata l'opzione "Emulate terminal in output
+console" nella configurazione di esecuzione (Run -> Edit Configurations),
+oppure si lancia il comando dal terminale integrato. La finestra grafica e
+l'interfaccia web non hanno questo vincolo.
+
+Nota per chi legge il progetto: il nome "main" e' storico, questo non e' il
+punto di ingresso del programma. Le interfacce per l'uso normale sono gui.py
+e web/app.py; questa e' un attrezzo di servizio. per il debugging.
+"""
+
+from pick import pick  # <--- Libreria per le freccette
 from scraper import genera_url_con_filtri, estrai_lista_bandi, BASE_URL, estrai_dati_json_anac, scarica_json_anac, estrai_dettagli_bando
 from datetime import datetime
 from save_data import salva_in_excel
@@ -224,6 +248,46 @@ def _stampa_lista_operatori(operatori, dichiarati, etichetta, piva_cercata=None)
 # METODO DI CONTROLLO E AVVIO RICERCA
 # =====================================================================
 def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="qualsiasi", contraente="qualsiasi", data_limite=None, data_fine=None, piva_invitato=None, nome_file=None):
+    """
+    Esegue una ricerca completa e ne salva il risultato in un file Excel.
+
+    E' il cuore del programma: coordina i tre moduli di logica, che da soli non
+    si conoscono fra loro. Per ogni bando trovato:
+
+      1. costruisce l'URL di ricerca con i filtri e ne ricava l'elenco dei
+         bandi (scraper.py);
+      2. ne legge la pagina di dettaglio: tipologia, enti, date, CIG;
+      3. scarica i PDF di esito e li interpreta, ricavando invitati, lotti e
+         gli eventuali CIG assenti dalla pagina (scraper_pdf.py);
+      4. interroga l'API ANAC per ciascun CIG: oggetto, CUP, CPV,
+         aggiudicatario (scraper.py);
+      5. accumula tutto e, alla fine, genera l'Excel (save_data.py).
+
+    A differenza delle interfacce grafica e web, qui il resoconto del lavoro
+    viene stampato passo passo: le stampe di questa funzione NON sono
+    diagnostica di servizio, sono l'interfaccia utente vera e propria.
+
+    Parametri dei filtri (tutti facoltativi: se omessi non restringono nulla)
+        parola_chiave   testo cercato nell'oggetto del bando
+        cig             CIG cercato, anche parziale
+        stato,          voci dei menu, in minuscolo perche' selezione_filtri
+        tipologia,      restituisce la scelta gia' convertita; le mappe
+        contraente      MAPPA_* di questo file le traducono nei codici del sito
+        data_limite     data di pubblicazione minima, formato ISO (aaaa-mm-gg)
+        data_fine       data di pubblicazione massima, stesso formato
+        piva_invitato   P.IVA o codice fiscale: tiene solo i bandi in cui quel
+                        soggetto compare fra gli invitati dichiarati nei PDF
+        nome_file       percorso del file Excel da creare
+
+    Non restituisce nulla: il risultato e' il file salvato e quanto stampato a
+    schermo. Se nessun bando supera i filtri, non viene creato alcun file.
+
+    Questa copia del motore e' leggermente diversa da quella condivisa da
+    gui.py e web/app.py: non ha l'interruzione (qui basta Ctrl+C) ne' la
+    segnalazione dell'avanzamento (lo raccontano le stampe), e non fa il
+    controllo preventivo sulla raggiungibilita' di ANAC. Le correzioni alla
+    logica vanno percio' riportate a mano anche qui.
+    """
     codice_stato = MAPPA_STATO[stato]
     codice_tipologia = MAPPA_TIPOLOGIA[tipologia]
     codice_contraente = MAPPA_CONTRAENTE[contraente]
@@ -353,7 +417,7 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                                             "Operatori invitati", piva_invitato)
             else:
                 # PIU' PDF (un PDF per lotto): ogni PDF ha i SUOI manifestanti e
-                # invitati (es. gara SP17/SP24: 134 nel Lotto A, 136 nel Lotto B),
+                # invitati ,
                 # quindi niente blocco comune: si stampano dentro ogni sezione
                 # [CIG: ...] dal PDF agganciato a quel CIG. Si evita anche
                 # un'estrazione doppia del primo PDF (ci pensa la cache del loop).
@@ -371,8 +435,7 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                 print(f"        -> [PDF] CIG dichiarato nel PDF: {dati_pdf.get('cig_pdf', 'Non presente')}")
                 for lotto in dati_pdf["lotti"]:
                     # Etichetta del lotto: senza questa, con piu' lotti i blocchi
-                    # stampati di seguito non erano attribuibili (Esito-205/208,
-                    # 9 lotti, gara senza alcun CIG ne' in pagina ne' nel PDF).
+                    # stampati di seguito non erano attribuibili
                     if lotto.get("nome_lotto"):
                         print(f"        -> [PDF] {lotto['nome_lotto']}:")
                     if lotto.get("cig_lotto", "Non presente") != "Non presente":
@@ -528,9 +591,8 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                                         for l in dati_pdf.get("lotti", []))
                     # Restrizione anche SENZA cig_lotto: se il PDF e' unico e i
                     # suoi lotti sono tanti quanti i CIG di pagina, l'ordine dei
-                    # lotti nel PDF corrisponde a quello dei CIG (Esito_F-2/F-3:
-                    # 2 CIG in pagina, "Lotto 1 campi sportivi - Lotto 2
-                    # palazzetto"). Senza questo ogni CIG stampava TUTTI i lotti,
+                    # lotti nel PDF corrisponde a quello dei CIG.
+                    # Senza questo ogni CIG stampava TUTTI i lotti,
                     # duplicando l'intero blocco a ogni giro del ciclo.
                     _posizionale = (not _ha_cig_lotto
                                     and len(lista_pdf) == 1

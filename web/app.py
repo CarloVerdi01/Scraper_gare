@@ -70,9 +70,50 @@ MAPPA_CONTRAENTE = {
 
 # =====================================================================
 # ORCHESTRAZIONE DELLA RICERCA
-# Spostata qui da main.py: e' il cuore che coordina i moduli di logica.
 # =====================================================================
 def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="qualsiasi", contraente="qualsiasi", data_limite=None, data_fine=None, piva_invitato=None, nome_file=None, deve_fermarsi=None, segnala_progresso=None):
+    """
+    Esegue una ricerca completa e ne salva il risultato in un file Excel.
+
+    E' il cuore del programma: coordina i tre moduli di logica, che da soli non
+    si conoscono fra loro. Per ogni bando trovato:
+
+      1. costruisce l'URL di ricerca con i filtri e ne ricava l'elenco dei
+         bandi (scraper.py);
+      2. ne legge la pagina di dettaglio: tipologia, enti, date, CIG;
+      3. scarica i PDF di esito e li interpreta, ricavando invitati, lotti e
+         gli eventuali CIG assenti dalla pagina (scraper_pdf.py);
+      4. interroga l'API ANAC per ciascun CIG: oggetto, CUP, CPV,
+         aggiudicatario (scraper.py);
+      5. accumula tutto e, alla fine, genera l'Excel (save_data.py).
+
+    Parametri dei filtri (tutti facoltativi: se omessi non restringono nulla)
+        parola_chiave   testo cercato nell'oggetto del bando
+        cig             CIG cercato, anche parziale
+        stato,          voci dei menu, tradotte nei codici del sito
+        tipologia,      tramite le mappe MAPPA_* di questo file
+        contraente
+        data_limite     data di pubblicazione minima, formato ISO (aaaa-mm-gg)
+        data_fine       data di pubblicazione massima, stesso formato
+        piva_invitato   P.IVA o codice fiscale: tiene solo i bandi in cui quel
+                        soggetto compare fra gli invitati dichiarati nei PDF
+
+    Altri parametri
+        nome_file       percorso del file Excel da creare
+        deve_fermarsi   funzione senza argomenti che restituisce True quando
+                        l'utente ha chiesto di interrompere. Viene interrogata
+                        all'inizio di ogni bando, mai a meta' di un'operazione
+        segnala_progresso  funzione (fatti, totale) chiamata a ogni bando
+                        completato, per aggiornare la barra di avanzamento
+
+    Restituisce
+        Un dizionario con la chiave "anac_giu": True se ANAC e' stato
+        interrogato ma non ha risposto per NESSUN CIG, cioe' se il servizio era
+        verosimilmente guasto. Serve ad avvisare che le colonne ANAC sono vuote
+        per un guasto, non perche' quelle gare non fossero pubblicate.
+        Restituisce None se l'utente ha interrotto la ricerca: in quel caso non
+        viene prodotto alcun file.
+    """
     codice_stato = MAPPA_STATO[stato]
     codice_tipologia = MAPPA_TIPOLOGIA[tipologia]
     codice_contraente = MAPPA_CONTRAENTE[contraente]
@@ -111,7 +152,7 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
         dati_bando = estrai_dettagli_bando(url_completo)
 
         lista_cig = dati_bando.get("cig_list", [])
-        # Alfabeto italiano completo (21 lettere, senza J K W X Y) — fix bando con 13 CIG (IndexError)
+        # Alfabeto italiano completo (21 lettere, senza J K W X Y)
         lettere_lotti = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'L', 'M', 'N',
                          'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'Z']
 
@@ -158,9 +199,7 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
             cig_effettivo = risolvi_cig(None, dati_pdf)
             dati_anac = {}
             if cig_effettivo != "Non trovato":
-                # ANAC con il CIG recuperato dal PDF: stessa struttura del blocco
-                # (oggi commentato) del loop multi-CIG, cosi' alla riattivazione
-                # di quello i due rami restano gemelli.
+                # ANAC con il CIG recuperato dal PDF se non è presente nella pagina
                 contatore_anac_tentati += 1
                 json_anac = scarica_json_anac(cig_effettivo)
                 if json_anac:
@@ -240,9 +279,8 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
                                         for l in dati_pdf.get("lotti", []))
                     # Restrizione anche SENZA cig_lotto: se il PDF e' unico e i
                     # suoi lotti sono tanti quanti i CIG di pagina, l'ordine dei
-                    # lotti nel PDF corrisponde a quello dei CIG (Esito_F-2/F-3:
-                    # 2 CIG in pagina, "Lotto 1 campi sportivi - Lotto 2
-                    # palazzetto"). Senza questo ogni CIG si sarebbe portato
+                    # lotti nel PDF corrisponde a quello dei CIG.
+                    # Senza questo ogni CIG si sarebbe portato
                     # dietro TUTTI i lotti, duplicandoli a ogni giro del ciclo.
                     _posizionale = (not _ha_cig_lotto
                                     and len(lista_pdf) == 1
@@ -346,7 +384,7 @@ def anac_raggiungibile(tentativi=3, pausa=2):
     ma quando ANAC risponde subito il controllo finisce in un colpo. Solo se
     TUTTI i tentativi falliscono il servizio e' considerato giu'.
     """
-    CIG_TEST = "A040010618"  # CIG reale e stabile (Chiesina Uzzanese, gia' verificato)
+    CIG_TEST = "A040010618"  # CIG reale e stabile (gia' verificato)
     for n in range(1, tentativi + 1):
         try:
             reimposta_via_anac()
@@ -360,7 +398,7 @@ def anac_raggiungibile(tentativi=3, pausa=2):
 
 
 def _iso(data_it):
-    """gg/mm/aaaa -> aaaa-mm-gg, il formato che l'orchestrazione si aspetta."""
+    """gg/mm/aaaa -> aaaa-mm-gg, il formato che la ricerca si aspetta."""
     try:
         return datetime.strptime(data_it, "%d/%m/%Y").strftime("%Y-%m-%d")
     except ValueError:
@@ -368,7 +406,7 @@ def _iso(data_it):
 
 
 def _esegui_ricerca(id_job, filtri):
-    """Gira nel thread di sfondo: chiama l'orchestrazione e registra l'esito."""
+    """Gira nel thread di sfondo: chiama l'operazione di ricerca e registra l'esito."""
     try:
         nome_file = filtri.get("nome_file") or \
             f"bandi_pistoia_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -379,11 +417,13 @@ def _esegui_ricerca(id_job, filtri):
         # Callback di avanzamento: registra nello stato del job a che bando si
         # e' arrivati, cosi' il polling del browser puo' disegnare la barra.
         def _progresso(fatti, totale):
+            """Registra l'avanzamento nello stato del job, per il polling."""
             with _lock:
                 if id_job in _job:
                     _job[id_job]["fatti"] = fatti
                     _job[id_job]["totale"] = totale
 
+        #si avvia la ricerca fornendo tutti i filtri
         esito = avvia_ricerca_bandi(
             parola_chiave=filtri.get("parola_chiave", ""),
             cig=filtri.get("cig", ""),
@@ -397,7 +437,7 @@ def _esegui_ricerca(id_job, filtri):
             deve_fermarsi=lambda: _job.get(id_job, {}).get("stop", False),
             segnala_progresso=_progresso,
         )
-        # Se l'utente ha interrotto, l'orchestrazione esce senza creare il file:
+        # Se l'utente ha interrotto, esce senza creare il file:
         # lo stato diventa "interrotto", non "finito".
         with _lock:
             if _job[id_job].get("stop"):
@@ -419,6 +459,14 @@ def _esegui_ricerca(id_job, filtri):
 
 @app.route("/")
 def home():
+    """
+    Mostra la pagina della ricerca.
+
+    Le voci dei menu a tendina non sono scritte nell'HTML: vengono passate qui
+    a partire dalle mappe dei filtri, cosi' aggiungere una tipologia significa
+    modificare un solo punto del progetto. Anche gli anni sono generati fino a
+    quello corrente, per non doverli aggiornare a mano ogni gennaio.
+    """
     anno_corrente = datetime.now().year
     return render_template(
         "index.html",
@@ -434,6 +482,24 @@ def home():
 
 @app.route("/avvia", methods=["POST"])
 def avvia():
+    """
+    Riceve i filtri dal browser e avvia la ricerca in sottofondo.
+
+    Non attende il risultato: una ricerca dura minuti, e una risposta HTTP cosi'
+    lunga verrebbe interrotta. Fa partire un thread e restituisce subito un
+    identificativo (id_job), che il browser usa poi per chiedere a che punto e'
+    tramite /stato.
+
+    Prima di partire controlla i dati ricevuti: le date devono esistere davvero
+    e essere in ordine, il nome del file non deve contenere caratteri vietati
+    dal sistema operativo, la P.IVA deve avere una lunghezza plausibile. Sono
+    gli stessi controlli gia' fatti nel browser, rifatti qui perche' quelli
+    lato pagina si possono aggirare.
+
+    Se ANAC non risponde non blocca nulla: restituisce un avviso e lascia
+    decidere all'utente, che puo' rilanciare con salta_anac per procedere
+    accettando le colonne ANAC vuote.
+    """
     d = request.get_json(force=True)
     data_inizio = (d.get("data_inizio") or "").strip() or None
     data_fine = (d.get("data_fine") or "").strip() or None
@@ -516,6 +582,13 @@ def avvia():
 
 @app.route("/interrompi/<id_job>", methods=["POST"])
 def interrompi(id_job):
+    """
+    Chiede l'interruzione della ricerca indicata.
+
+    Non ferma il thread: alza una bandiera che l'orchestrazione controlla
+    all'inizio di ogni bando, cosi' lo stop avviene a un punto pulito e mai a
+    meta' di una chiamata di rete o di una scrittura.
+    """
     # Alza la bandiera di stop: il thread la controlla all'inizio di ogni bando
     # e esce ordinatamente. Non ferma nulla di colpo.
     with _lock:
@@ -527,6 +600,10 @@ def interrompi(id_job):
 
 @app.route("/stato/<id_job>")
 def stato(id_job):
+    """
+    Riferisce lo stato di una ricerca: interrogata dal browser
+    ogni due secondi per aggiornare la barra di avanzamento.
+    """
     with _lock:
         s = _job.get(id_job)
     if not s:
@@ -536,6 +613,7 @@ def stato(id_job):
 
 @app.route("/scarica/<nome>")
 def scarica(nome):
+    """Invia al browser il file Excel prodotto, come allegato da scaricare."""
     return send_from_directory(CARTELLA_OUTPUT, nome, as_attachment=True)
 
 

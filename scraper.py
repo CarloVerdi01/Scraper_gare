@@ -1,3 +1,36 @@
+"""
+Raccolta dei dati dal sito della Provincia di Pistoia e dall'API ANAC.
+
+Copre due delle tre fonti del programma (la terza, i PDF di esito, sta in
+scraper_pdf.py) e non dipende da nessuna interfaccia: e' lo stesso file per
+la finestra grafica, per la web app e per la versione da terminale.
+
+Dal sito della Provincia
+    genera_url_con_filtri   costruisce l'indirizzo di ricerca dai filtri
+    estrai_lista_bandi      scorre le pagine dei risultati e raccoglie i link
+    estrai_dettagli_bando   legge la pagina di un bando: tipologia, enti,
+                            date, CIG
+
+    I dati si riconoscono dalle classi CSS delle pagine
+
+Dall'API ANAC
+    scarica_json_anac       porta d'ingresso: sceglie da sola la via da usare (se diretta o con verifica Mosparo)
+    estrai_dati_json_anac   estrae dal JSON i campi che servono
+
+    ANAC protegge il servizio con Mosparo, una verifica anti-bot. Esistono
+    percio' due vie: quella diretta e quella con verifica
+    (_scarica_json_anac_mosparo), che richiede cookie di sessione, un token e
+    un proof of work SHA-256. La prima volta che il server pretende la
+    verifica il programma se ne accorge e da li' in poi usa la via giusta,
+    per non sprecare richieste destinate a fallire — sono quelle che fanno
+    scattare i blocchi per eccesso di traffico.
+
+    La chiave pubblica di Mosparo non e' fissa nel codice: si legge da
+    runtime-config.js, il file dove ANAC la pubblica, con una copia di
+    riserva usata solo se il recupero fallisce.
+
+"""
+
 import requests
 from bs4 import BeautifulSoup
 import urllib.parse  # Serve per gestire correttamente gli spazi e i caratteri speciali nei filtri
@@ -14,7 +47,7 @@ BASE_URL = "https://www.provincia.pistoia.it"
 
 def genera_url_con_filtri(parola_chiave="", cig="", stato="All", contraente="All", tipologia="All"):
     """
-    Questa funzione è il cuore generico: prende i parametri (filtri) che decidi tu
+    Questa funzione prende i parametri (filtri) richiesti
     e costruisce l'URL perfetto per il sito.
     """
     # Puliamo la parola chiave per renderla leggibile da un URL (es. trasforma gli spazi in %20)
@@ -33,6 +66,28 @@ def genera_url_con_filtri(parola_chiave="", cig="", stato="All", contraente="All
 
 
 def estrai_lista_bandi(url_con_filtri, data_limite=None, data_fine=None):
+    """
+    Raccoglie gli indirizzi di tutti i bandi che rispondono ai filtri.
+
+    Scorre le pagine dei risultati una dopo l'altra finche' esiste il pulsante
+    "successiva", legge la tabella di ciascuna e scarta i doppioni. Fra una
+    pagina e l'altra attende un secondo, per non sovraccaricare il server.
+
+    Parametri
+        url_con_filtri  indirizzo di ricerca prodotto da genera_url_con_filtri
+        data_limite     data di pubblicazione minima (aaaa-mm-gg), facoltativa
+        data_fine       data di pubblicazione massima, facoltativa
+
+    Restituisce
+        La lista degli indirizzi dei bandi, dal piu' recente al piu' vecchio.
+        Lista vuota se nessun bando corrisponde o se il server non risponde:
+        un problema di rete non solleva un'eccezione, ferma la raccolta.
+
+    Le due date non agiscono allo stesso modo, per il motivo spiegato nel
+    dettaglio piu' sotto: i bandi arrivano ordinati dal piu' recente, quindi
+    la data di inizio permette di fermare tutto quando la si oltrepassa,
+    mentre la data di fine obbliga solo a saltare i bandi troppo recenti.
+    """
     # INIZIALIZZAZIONE
     link_bandi = []  # Lista dei link raccolti da restituire alla fine del metodo
     link_visti = set()  # Insieme per il controllo die duplicati, verificare "x" in link_visti è molto più rapido che "x" in link_bandi quando la lista cresce.
@@ -127,6 +182,22 @@ def estrai_lista_bandi(url_con_filtri, data_limite=None, data_fine=None):
 
 
 def estrai_dettagli_bando(url_bando):
+    """
+    Legge la pagina di un singolo bando e ne estrae i dati pubblicati.
+
+    Restituisce sempre un dizionario con le stesse otto chiavi: url_provincia,
+    tipologia, scelta_contraente, enti, cig_list, data_pubblicazione,
+    scadenza_manifestazione, data_scadenza. I campi assenti dalla pagina
+    valgono "Non presente"; cig_list e' una lista, perche' i bandi multi-lotto
+    hanno piu' CIG, e puo' essere vuota.
+
+    Non solleva mai eccezioni: un errore di rete o una pagina dalla struttura
+    imprevista producono il dizionario coi valori predefiniti, cosi' un singolo
+    bando problematico non interrompe una scansione da centinaia.
+
+    I dati si riconoscono dalle classi CSS che il sito assegna a ogni campo
+    (field--name-field-*)
+    """
     # Inizializza il dizionario con valori di default
     dati_bando = {
         "url_provincia": url_bando,
@@ -171,8 +242,7 @@ def estrai_dettagli_bando(url_bando):
 
                 # 1. Prova a estrarre CIG dall'URL (più affidabile — sempre presente nel path)
                 # {9,10}: alcune pagine riportano il CIG TRONCATO a 9 caratteri
-                # (refuso di pagina, es. bando Monsummano/Pescia: il Lotto 2 in
-                # pagina ha 9 char, il PDF dichiara il CIG pieno B1DE6AA5C5).
+                # (refuso di pagina).
                 # Il codice monco viene accettato qui e poi agganciato PER
                 # PREFISSO al CIG pieno del PDF (scraper_pdf), che da lì in poi
                 # è quello usato per risultati, Excel e ANAC.
@@ -225,8 +295,23 @@ def estrai_dettagli_bando(url_bando):
     return dati_bando  # ritorna i dati
 
 
-def estrai_dati_json_anac(
-        dati_json):  # Questo meotod riceve un dizionario Python già pronto (JSON convertito) e ne estrae i campi che ci interessano
+def estrai_dati_json_anac(dati_json):  # Questo meotod riceve un dizionario Python già pronto (JSON convertito) e ne estrae i campi che ci interessano
+    """
+    Estrae i campi che interessano dalla risposta JSON dell'API ANAC.
+
+    E' l'unica funzione del modulo che non tocca la rete: riceve un dizionario
+    gia' scaricato da scarica_json_anac e lo prende le otto voci usate
+    dal programma (numero gara, oggetto, CPV con descrizione, CUP, tipo di
+    scelta del contraente, aggiudicatario e suo codice fiscale).
+
+    Restituisce sempre tutte le chiavi, con "Non presente" dove il dato manca;
+    un JSON vuoto o None da' il dizionario predefinito.
+
+    Dei partecipanti tiene solo quelli contrassegnati come aggiudicatari. Se
+    sono piu' d'uno, come nei raggruppamenti di imprese, li unisce in una sola
+    stringa separata da virgole, mantenendo nomi e codici fiscali nello stesso
+    ordine perche' restino appaiati.
+    """
     # INIZIALIZZAZIONE
     risultato = {
         "numero_gara": "Non presente",
@@ -287,12 +372,11 @@ def estrai_dati_json_anac(
     return risultato  # ritorna i valori ottenuti
 
 
-# Chiave pubblica del form Mosparo di ANAC. Non e' piu' cablata a mano: la si
-# recupera da runtime-config.js (vedi ottieni_chiave_mosparo piu' sotto), il
+# Chiave pubblica del form Mosparo di ANAC. Si
+# recupera da runtime-config.js (vedi ottieni_chiave_mosparo sotto), il
 # file dove ANAC la pubblica. Questo valore resta come RISERVA, usato solo se
 # il recupero automatico fallisce, cosi' il programma non si blocca mai.
-# ANAC la cambia quando reinstalla Mosparo: prima serviva aggiornare a mano
-# questa costante, ora il recupero automatico prende la nuova da solo.
+# ANAC la cambia quando reinstalla Mosparo: il recupero automatico prende la nuova da solo.
 # Storico: jUHeENQtdJN-tmRO0FWpv1QnvTyfWpifwSHMpNOcSck (non piu' valida)
 MOSPARO_PUBLIC_KEY_RISERVA = "IvdGTv3BCns5EerGuPtrT7S_mLlZPEbPZy9Y7jj1q94"
 
@@ -315,7 +399,7 @@ def ottieni_chiave_mosparo(forza_refresh=False):
 
     Se il file non e' raggiungibile o non contiene la chiave, si ripiega sul
     valore di RISERVA cablato: il programma continua a funzionare con l'ultima
-    chiave nota, esattamente come prima di questa modifica.
+    chiave nota.
     """
     global _chiave_mosparo_cache
     if _chiave_mosparo_cache and not forza_refresh:
@@ -363,8 +447,7 @@ def _richiede_mosparo(risposta):
     quando l'endpoint rifiuta il payload privo dei campi _mosparo_*) e la
     comparsa della parola "mosparo"/"submitToken" nel corpo della risposta.
     Il controllo e' volutamente prudente: in caso di dubbio torna False e si
-    prosegue con i normali tentativi diretti, senza pagare il costo del
-    proof of work quando non serve.
+    prosegue con i normali tentativi diretti
     """
     if risposta is None:
         return False
@@ -396,7 +479,7 @@ def scarica_json_anac(cig, tentativi=15, via=None):
     via="diretto" o via="mosparo" forza una delle due strade, utile per le
     prove; None (default) lascia decidere al meccanismo automatico.
 
-    Firma e valore di ritorno identici alla versione precedente: il dict del
+    Firma e valore di ritorno: il dict del
     CIG, oppure None se non si recupera nulla. Nessun chiamante va adeguato.
     """
     global _via_anac_rilevata
@@ -427,15 +510,34 @@ def scarica_json_anac(cig, tentativi=15, via=None):
     return dati
 
 
-# =====================================================================
-# VIA CON VERIFICA MOSPARO — usata come RIPIEGO automatico
-# ANAC ha rimosso la verifica anti-bot dall'endpoint consultaCIG, quindi la
-# via normale e' quella diretta. Questa resta pronta e viene richiamata da
-# scarica_json_anac() quando il server torna a pretendere i token Mosparo.
-# Flusso: cookie di sessione -> submit token -> proof of work SHA-256 ->
-# validazione form -> chiamata consultaCIG con i token _mosparo_*.
-# =====================================================================
+
 def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
+    """
+    Scarica i dati ANAC di un CIG superando la verifica anti-bot Mosparo.
+
+    E' la via di ripiego, non quella normale: la usa scarica_json_anac quando
+    il server torna a pretendere i token. Richiede quattro chiamate HTTP in
+    sequenza piu' un calcolo, secondo i passi descritti qui sotto: cookie di
+    sessione, richiesta del submit token, proof of work, validazione del form,
+    e infine la chiamata vera al servizio.
+
+    Il proof of work e' il cuore del meccanismo: il server manda un hash e
+    bisogna trovare il numero che, unito al token e passato in SHA-256, lo
+    riproduce. Si prova un numero dopo l'altro; e' un lavoro volutamente
+    ripetitivo, pensato per costare poco a un utente e molto a chi automatizza.
+
+    Parametri
+        cig         codice di 10 caratteri; codici di lunghezza diversa
+                    vengono rifiutati subito, senza consumare tentativi
+        tentativi   quanti giri fare prima di arrendersi, con otto secondi
+                    di pausa fra uno e l'altro
+
+    Restituisce
+        Il dizionario JSON di ANAC, oppure None se il codice non e' valido, se
+        i tentativi si esauriscono o se ANAC rifiuta la chiave pubblica. In
+        quest'ultimo caso non insiste: rilegge la chiave da runtime-config.js
+        una volta e, se non e' cambiata, esce spiegando l'accaduto.
+    """
     # Stessa guardia della via diretta: un CIG non e' mai diverso da 10
     # caratteri. Qui pesa ancora di piu', perche' ogni tentativo costa
     # QUATTRO chiamate HTTP piu' il proof of work (ciclo SHA-256 fino a
@@ -585,9 +687,7 @@ def _scarica_json_anac_diretto(cig, tentativi=15, serve_mosparo=None):
     ANAC ha rimosso la verifica anti-bot Mosparo dall'endpoint consultaCIG:
     il POST con il solo {"cig": ...} restituisce direttamente i dati. Si
     mantiene lo STEP 0 (visita della pagina del CIG per i cookie di sessione),
-    innocuo e potenzialmente ancora richiesto dal server.
-    La versione precedente con Mosparo e' archiviata qui sopra, pronta al
-    ripristino se la verifica venisse reintrodotta.
+    innocuo e potenzialmente ancora richiesto dal server..
 
     Ritorna il dict del CIG (primo elemento se l'API risponde con una lista),
     None se tutti i tentativi falliscono — contratto identico alla versione
@@ -661,330 +761,3 @@ def _scarica_json_anac_diretto(cig, tentativi=15, serve_mosparo=None):
     return None
 
 
-'''
-#Versione con chaive pubblica fissa
-# Chiave pubblica del form Mosparo di ANAC. E' statica per quell'installazione
-# e si legge dagli strumenti di sviluppo del browser: pagina di un CIG ->
-# scheda Rete -> chiamata "request-submit-token" -> Payload -> publicKey.
-# ANAC la cambia quando reinstalla Mosparo: quando succede, il server risponde
-# 403 allo STEP 1 ("Il server ANAC e' irraggiungibile o in errore") e basta
-# aggiornare questa costante, senza toccare il resto del flusso.
-# Storico: jUHeENQtdJN-tmRO0FWpv1QnvTyfWpifwSHMpNOcSck (non piu' valida)
-MOSPARO_PUBLIC_KEY = "IvdGTv3BCns5EerGuPtrT7S_mLlZPEbPZy9Y7jj1q94"
-
-# Via da usare per le chiamate ANAC, ricordata dopo il primo rilevamento.
-# None = ancora da stabilire; "mosparo" = il server ha chiesto la verifica.
-# Serve a non ripetere per OGNI CIG la chiamata diretta destinata a fallire:
-# quelle richieste sprecate sono anche cio' che fa scattare il rate limit 429.
-# Si memorizza solo l'esito "serve mosparo", non il contrario: se la diretta
-# funziona non c'e' nulla da ricordare, e' gia' la prima che si prova.
-_via_anac_rilevata = None
-
-
-def reimposta_via_anac():
-    """
-    Dimentica la via ANAC memorizzata, tornando al rilevamento automatico.
-    Utile se ANAC cambia comportamento durante l'esecuzione o fra due giri
-    nella stessa sessione (es. dalla GUI, senza riavviare il programma).
-    """
-    global _via_anac_rilevata
-    _via_anac_rilevata = None
-
-
-def _richiede_mosparo(risposta):
-    """
-    True se la risposta del server indica che i token Mosparo sono richiesti.
-
-    Non esiste un flag esplicito: si riconoscono i due modi in cui ANAC lo
-    manifesta, cioe' lo stato HTTP tipico del blocco anti-bot (401/403, e 400
-    quando l'endpoint rifiuta il payload privo dei campi _mosparo_*) e la
-    comparsa della parola "mosparo"/"submitToken" nel corpo della risposta.
-    Il controllo e' volutamente prudente: in caso di dubbio torna False e si
-    prosegue con i normali tentativi diretti, senza pagare il costo del
-    proof of work quando non serve.
-    """
-    if risposta is None:
-        return False
-    if getattr(risposta, "status_code", None) in (400, 401, 403):
-        return True
-    try:
-        corpo = (risposta.text or "").lower()
-    except Exception:
-        return False
-    return "mosparo" in corpo or "submittoken" in corpo
-
-
-def scarica_json_anac(cig, tentativi=15, via=None):
-    """
-    Recupera il JSON del CIG da ANAC scegliendo da sola la via giusta.
-
-    Prova per prima la via DIRETTA, che e' quella che oggi funziona e costa
-    una sola chiamata. Se il server torna a pretendere i token della verifica
-    anti-bot, ripiega automaticamente sulla via con MOSPARO (submit token,
-    proof of work SHA-256, validazione form). Il ripiego scatta al primo
-    segnale, senza esaurire i tentativi su richieste che non possono passare.
-
-    Il rilevamento avviene UNA VOLTA SOLA: accertato che serve la verifica,
-    i CIG successivi partono direttamente da Mosparo, senza ripetere ogni
-    volta una chiamata diretta che si sa gia' destinata a fallire (due
-    richieste sprecate per CIG, che oltre a rallentare alimentano il rate
-    limit 429). reimposta_via_anac() azzera la memoria se serve.
-
-    via="diretto" o via="mosparo" forza una delle due strade, utile per le
-    prove; None (default) lascia decidere al meccanismo automatico.
-
-    Firma e valore di ritorno identici alla versione precedente: il dict del
-    CIG, oppure None se non si recupera nulla. Nessun chiamante va adeguato.
-    """
-    global _via_anac_rilevata
-
-    if via == "mosparo":
-        return _scarica_json_anac_mosparo(cig, tentativi=tentativi)
-    if via == "diretto":
-        return _scarica_json_anac_diretto(cig, tentativi=tentativi)
-
-    # Se un CIG precedente ha gia' accertato che il server pretende la
-    # verifica, si va diritti su quella via: ripetere la chiamata diretta per
-    # ogni CIG significherebbe due richieste sprecate a testa, che oltre a
-    # rallentare contribuiscono a far scattare il rate limit.
-    if _via_anac_rilevata == "mosparo":
-        return _scarica_json_anac_mosparo(cig, tentativi=tentativi)
-
-    # "serve_mosparo" e' una lista di un elemento usata come segnale scritto
-    # dalla via diretta: se il server pretende i token, quella la imposta a
-    # True e si ferma subito, cosi' qui si capisce che il fallimento non e'
-    # un errore di rete da ritentare ma la richiesta di cambiare strada.
-    serve_mosparo = [False]
-    dati = _scarica_json_anac_diretto(cig, tentativi=tentativi,
-                                      serve_mosparo=serve_mosparo)
-    if dati is None and serve_mosparo[0]:
-        # Rilevamento fatto una volta sola: da qui in avanti si parte da Mosparo.
-        _via_anac_rilevata = "mosparo"
-        return _scarica_json_anac_mosparo(cig, tentativi=tentativi)
-    return dati
-
-
-# =====================================================================
-# VIA CON VERIFICA MOSPARO — usata come RIPIEGO automatico
-# ANAC ha rimosso la verifica anti-bot dall'endpoint consultaCIG, quindi la
-# via normale e' quella diretta. Questa resta pronta e viene richiamata da
-# scarica_json_anac() quando il server torna a pretendere i token Mosparo.
-# Flusso: cookie di sessione -> submit token -> proof of work SHA-256 ->
-# validazione form -> chiamata consultaCIG con i token _mosparo_*.
-# =====================================================================
-def _scarica_json_anac_mosparo(cig, tentativi=15):  # vecchi tentativi 5, 10
-    # Stessa guardia della via diretta: un CIG non e' mai diverso da 10
-    # caratteri. Qui pesa ancora di piu', perche' ogni tentativo costa
-    # QUATTRO chiamate HTTP piu' il proof of work (ciclo SHA-256 fino a
-    # proofOfWorkMaxNumber): su un codice inesistente sarebbe tutto lavoro
-    # sprecato, ripetuto per tutti i tentativi.
-    if not cig or len(cig) != 10:
-        log(f"    [-] CIG non valido ({len(cig) if cig else 0} caratteri): '{cig}' — salto la chiamata ANAC")
-        return None
-
-    for tentativo in range(1, tentativi + 1):  # itera sui tentativi
-        if tentativo > 1:  # se non è il primo tentativo fa una pausa, al primo non avrebbe senso
-            log(f"    [!] Tentativo {tentativo}/{tentativi}...")
-            time.sleep(8)
-
-        sessione = requests.Session()  # ad ogni tentativo viene creata una nuova sessione
-        # è essenziale perché Mosparo lega il token alla sessione/cookie ottenuti nello STEP 0.
-        # Crearne una nuova ad ogni tentativo garantisce di partire "pulito", senza cookie scaduti o
-        # invalidati dal tentativo precedente.
-        try:
-            # STEP 0: Cookie di sessione
-            # Visita la pagina del CIG nel browser ANAC. Non ci interessa il contenuto della risposta — l'unico scopo è far sì che il server imposti i cookie di sessione nella sessione,
-            # che verranno automaticamente inclusi in tutte le richieste successive fatte con la stessa sessione
-            url_pagina = f"https://dettaglio-cig.anticorruzione.it/cig/{cig}"
-            sessione.get(url_pagina, timeout=20)  # vecchio 45
-
-            # STEP 1: Submit token
-            # Mosparo richiede un "submit token" prima di accettare qualsiasi dato dal form
-            url_token = "https://dettaglio-cig.anticorruzione.it/mosparo/api/v1/frontend/request-submit-token"
-            payload_token = {
-                "pageTitle": "dati-cig",
-                "pageUrl": url_pagina,
-                "htmlLanguage": "en",
-                "publicKey": MOSPARO_PUBLIC_KEY
-                # è la chiave pubblica del form Mosparo presente sul sito — è statica/fissa per quel form specifico, l'abbiamo trovata ispezionando la richiesta nel browser.
-            }
-            risposta_token = sessione.post(url_token, json=payload_token,
-                                           timeout=10)  # json=payload_token invia il dizionario come corpo JSON della richiesta POST (requests lo converte automaticamente e imposta Content-Type: application/json).
-            # Controlla se il server ha risposto con un errore (es. 500, 502, 503)
-            if not risposta_token.ok:
-                log(f"    [-] Il server ANAC è irraggiungibile o in errore (Status: {risposta_token.status_code})")
-                # 401/403 allo STEP 1 = il server RIFIUTA la chiave pubblica,
-                # non e' un disservizio passeggero. Ritentare identici altri 14
-                # volte e' inutile: si esce subito spiegando cosa aggiornare.
-                if risposta_token.status_code in (401, 403):
-                    log("    [-] Chiave pubblica Mosparo rifiutata: probabilmente ANAC l'ha cambiata.")
-                    log("        Aggiorna MOSPARO_PUBLIC_KEY leggendola dagli strumenti di sviluppo")
-                    log("        (pagina CIG -> Rete -> request-submit-token -> Payload -> publicKey).")
-                    return None
-                continue  # Passa al tentativo successivo senza far crashare il programma
-            dati_token = risposta_token.json()  # .json() converte la risposta (testo JSON) in un dizionario Python
-            # Estraiamo 3 valori dalla risposta
-            submit_token = dati_token["submitToken"]  # il token che useremo nei passi successivi
-            proof_of_work_result = dati_token[
-                "proofOfWorkResult"]  # l'hash target che dobbiamo "indovinare" nel passo 2
-            proof_of_work_max = dati_token[
-                "proofOfWorkMaxNumber"]  # il limite massimo entro cui cercare il numero giusto
-
-            # STEP 2: Calcolo proof of work
-            # Questo è il meccanismo "anti-bot" che abbiamo decodificato dal file JavaScript di Mosparo:
-            # il server fornisce un hash target (proof_of_work_result) e noi dobbiamo trovare un numero n tale che
-            # SHA256(submitToken + n) produca esattamente quell'hash.
-            proof_number = None
-            for n in range(proof_of_work_max + 1):  # prova n = 0, 1, 2, ..., proof_of_work_max
-                stringa = f"{submit_token}{n}"  # Per ognuno, concatena submit_token e n come stringa, calcola l'hash SHA-256
-                hash_risultato = hashlib.sha256(
-                    stringa.encode('utf-8')).hexdigest()  # restituisce l'hash come stringa esadecimale)
-                if hash_risultato == proof_of_work_result:  # confronta con il target
-                    proof_number = n  # Quando trova la corrispondenza, salva n in proof_number
-                    break  # esce dal ciclo
-
-            if proof_number is None:  # Se nessun numero nel range produce l'hash giusto (caso anomalo, non dovrebbe succedere quasi mai), proof_number resta None
-                log(f"    [-] Proof of work non trovato per CIG {cig}")
-                continue  # salta al tentativo successivo del ciclo esterno — non ha senso proseguire senza questo numero.
-
-            # STEP 3: Validazione form
-            # Prepara i "dati del form" come li manderebbe il browser —
-            # un oggetto che descrive il campo cig con il suo valore
-            url_check = "https://dettaglio-cig.anticorruzione.it/mosparo/api/v1/frontend/check-form-data"
-            form_data_stringa = json.dumps({
-                # converte il dizionario in una stringa JSON compatta (senza spazi dopo virgole e due punti) — necessario perché Mosparo confronta questa stringa esatta per validare l'integrità dei dati.
-                "fields": [{"name": "cig", "value": cig, "fieldPath": "input[text].cig"}],
-                "ignoredFields": []
-            }, separators=(',', ':'))
-
-            payload_check = {
-                "formData": form_data_stringa,
-                "submitToken": submit_token,
-                "proofOfWorkNumber": proof_number,
-                "publicKey": MOSPARO_PUBLIC_KEY
-            }
-            risposta_check = sessione.post(url_check, data=payload_check,
-                                           timeout=10)  # Nota data=payload_check invece di json=payload_check —
-            # questa è la differenza che avevamo scoperto: il browser invia
-            # questi dati come form URL-encoded (Content-Type: application/x-www-form-urlencoded),
-            # non come JSON. requests con data= (un dizionario) li codifica automaticamente in quel formato.
-            dati_check = risposta_check.json()
-
-            if not dati_check.get("valid"):  # Se la risposta non contiene "valid": true, la validazione è fallita
-                log(f"    [-] Validazione Mosparo fallita per CIG {cig}")
-                continue  # si passa al tentativo successivo
-
-            validation_token = dati_check[
-                "validationToken"]  # altrimenti si estrae il validation_token, l'ultimo "permesso" necessario.
-
-            # STEP 4: Scarica i dati del CIG
-            # Ora che abbiamo entrambi i token Mosparo (submitToken e validationToken),
-            # possiamo chiamare l'endpoint vero che restituisce i dati del CIG
-            url_cig = "https://dettaglio-cig.anticorruzione.it/api/v1/operations/consultaCIG/1.0/exec"
-            payload_cig = {
-                "cig": cig,
-                "_mosparo_submitToken": submit_token,
-                "_mosparo_validationToken": validation_token
-            }
-            risposta_cig = sessione.post(url_cig, json=payload_cig,
-                                         timeout=10)  # torniamo a json= perché questo endpoint si aspetta JSON (diverso dal form Mosparo).
-
-            if risposta_cig.status_code == 200:  # Se la risposta è 200, prendiamo il JSON
-                dati = risposta_cig.json()
-                return dati[0] if isinstance(dati, list) and len(
-                    dati) > 0 else dati  # isinstance(dati, list) and len(dati) > 0 controlla: è una lista e non è vuota? Se sì, restituiamo il primo elemento (dati[0]) — l'API restituisce i dati del CIG dentro una lista con un solo elemento, quindi "scartiamo" il livello lista esterno, se non è una lista (o è vuota), restituiamo dati così com'è
-            else:  # Se invece lo status non è 200, stampiamo l'errore e continue al tentativo successivo.
-                log(f"    [-] API CIG ha risposto con codice: {risposta_cig.status_code}")
-                continue
-
-        except Exception as e:
-            log(
-                f"    [-] Errore tentativo {tentativo} per CIG {cig}: {e}")  # Qualsiasi eccezione (timeout, errore di rete, JSON malformato, chiave mancante in dati_token["submitToken"] se la risposta non ha quella struttura) viene catturata qui e stampata, poi il ciclo for continua al tentativo successivo automaticamente
-
-    log(
-        f"    [-] Tutti i tentativi falliti per CIG {cig}")  # Se tutti i tentativi falliscono (nessun return è stato eseguito), si arriva dopo il for e si restituisce None — che il main interpreta come "impossibile recuperare i dati ANAC".
-    return None
-
-
-def _scarica_json_anac_diretto(cig, tentativi=15, serve_mosparo=None):
-    """
-    Scarica il JSON del CIG dal sito ANAC — versione SENZA verifica Mosparo.
-
-    ANAC ha rimosso la verifica anti-bot Mosparo dall'endpoint consultaCIG:
-    il POST con il solo {"cig": ...} restituisce direttamente i dati. Si
-    mantiene lo STEP 0 (visita della pagina del CIG per i cookie di sessione),
-    innocuo e potenzialmente ancora richiesto dal server.
-    La versione precedente con Mosparo e' archiviata qui sopra, pronta al
-    ripristino se la verifica venisse reintrodotta.
-
-    Ritorna il dict del CIG (primo elemento se l'API risponde con una lista),
-    None se tutti i tentativi falliscono — contratto identico alla versione
-    Mosparo, nessun cambiamento per i chiamanti.
-
-    serve_mosparo, se passato, e' una lista di un elemento che questa funzione
-    imposta a True quando il server pretende i token della verifica anti-bot:
-    e' il segnale con cui il dispatcher distingue "non ci sono riuscito" da
-    "serve l'altra via". Chi chiama questa funzione da sola puo' ignorarlo.
-    """
-    # Guardia: un CIG non e' mai diverso da 10 caratteri alfanumerici. Un codice
-    # monco (es. troncato a 9 in pagina) non esiste in ANAC: chiamare l'API
-    # brucerebbe TUTTI i tentativi (15 x 8s) per nulla. Si rifiuta subito,
-    # qualunque sia il chiamante (main, GUI, ...).
-    if not cig or len(cig) != 10:
-        log(f"    [-] CIG non valido ({len(cig) if cig else 0} caratteri): '{cig}' — salto la chiamata ANAC")
-        return None
-
-    for tentativo in range(1, tentativi + 1):
-        if tentativo > 1:
-            log(f"    [!] Tentativo {tentativo}/{tentativi}...")
-            time.sleep(8)
-
-        sessione = requests.Session()  # sessione nuova ad ogni tentativo: si parte puliti
-        try:
-            # STEP 0: cookie di sessione (visita della pagina del CIG)
-            url_pagina = f"https://dettaglio-cig.anticorruzione.it/cig/{cig}"
-            sessione.get(url_pagina, timeout=20)
-
-            # STEP 1: chiamata diretta all'endpoint dei dati del CIG
-            url_cig = "https://dettaglio-cig.anticorruzione.it/api/v1/operations/consultaCIG/1.0/exec"
-            payload_cig = {"cig": cig}  # senza Mosparo bastano i dati del CIG
-            risposta_cig = sessione.post(url_cig, json=payload_cig, timeout=10)
-
-            if risposta_cig.status_code == 200:
-                dati = risposta_cig.json()
-                # l'API restituisce i dati dentro una lista con un solo elemento
-                return dati[0] if isinstance(dati, list) and len(dati) > 0 else dati
-
-            # 429 = Too Many Requests: ANAC sta limitando la FREQUENZA, non
-            # chiede una verifica. Ritentare subito peggiora la situazione:
-            # si rispetta l'header Retry-After se c'e', altrimenti si aspetta
-            # un tempo crescente col numero di tentativi.
-            if risposta_cig.status_code == 429:
-                try:
-                    attesa = int(risposta_cig.headers.get("Retry-After", 0))
-                except (TypeError, ValueError):
-                    attesa = 0
-                attesa = attesa or min(60, 8 * tentativo)
-                log(f"    [-] ANAC limita le richieste (429): attendo {attesa}s")
-                time.sleep(attesa)
-                continue
-
-            # Il server pretende di nuovo i token Mosparo: inutile insistere
-            # per tutti i tentativi con una richiesta che non puo' passare.
-            # Si segna il motivo nel flag del chiamante e si esce subito, cosi'
-            # il dispatcher sa che deve ripiegare sulla via con verifica.
-            if _richiede_mosparo(risposta_cig):
-                log("    [!] ANAC richiede la verifica Mosparo: passo alla via con verifica")
-                if serve_mosparo is not None:
-                    serve_mosparo[0] = True
-                return None
-
-            log(f"    [-] API CIG ha risposto con codice: {risposta_cig.status_code}")
-            continue
-
-        except Exception as e:
-            log(f"    [-] Errore tentativo {tentativo} per CIG {cig}: {e}")
-
-    log(f"    [-] Tutti i tentativi falliti per CIG {cig}")
-    return None
-'''

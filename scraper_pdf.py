@@ -1,3 +1,42 @@
+"""Lettura e interpretazione dei PDF di esito allegati ai bandi.
+
+E' il modulo piu' lungo del progetto, e il motivo e' che i PDF non hanno un formato: l'unico modo per leggerli tutti e' riconoscere caso per caso com'e' fatto quello che si ha davanti.
+Da qui deriva l'organizzazione del file.
+Dati che si ricavano solo da qui
+    Manifestanti, invitati con le loro P.IVA e codici fiscali, offerte
+    ricevute, ammesse ed escluse, aggiudicatario, ribasso, importo. Sono
+    informazioni che ne' la pagina della Provincia ne' l'API ANAC espongono:
+    esistono soltanto dentro i documenti.
+
+I quattro formati riconosciuti
+    standard        un solo blocco di sezioni ("Operatori che hanno
+                    manifestato interesse", "Invitati", "Offerte"...),valido
+                    sia per le gare a lotto unico sia per molte multi-lotto
+    per_lotto       il documento si ripete per intero per ogni lotto
+    per_lotto_sub   variante del precedente con sotto-sezioni annidate
+    multi_lotto_std un unico PDF con sezioni auto-contenute "Lotto N - Titolo"
+
+    rileva_formato_pdf() stabilisce quale sia, e da li' si dirama verso la
+    famiglia di estrattori corrispondente. Dentro il formato standard esistono
+    poi diverse varianti multi-lotto (CIG in testata, campi etichettati riga
+    per riga, sezioni globali...), ciascuna con la sua funzione dedicata: sono
+    i casi incontrati sui bandi reali.
+
+Come e' organizzato il file
+        Costanti globali          espressioni regolari e delimitatori condivisi
+        Helper generici           pulizia dei nomi, ricomposizione delle righe
+                                  spezzate dall'andata a capo
+        Estrattori STANDARD       dalla singola sezione fino al lotto completo
+        Estrattori PER_LOTTO      e PER_LOTTO_SUB, le due varianti ripetitive
+        Funzioni pubbliche        cio' che usano le interfacce: rilevamento del
+                                  formato, estrazione completa, e le utilita' su
+                                  P.IVA e CIG (invitato_con_piva, cig_compatibile,
+                                  seleziona_pdf_per_cig, costruisci_lista_cig)
+Un limite
+   I PDF scansionati sono immagini senza testo: pdfplumber non ne ricava
+    nulla e i campi restano a "Non presente". Servirebbe un OCR, con i rischi
+    di lettura che comporta su codici come le P.IVA."""
+
 import re
 import io
 import requests
@@ -27,7 +66,7 @@ _DELIMITATORI_BASE = (
     r'|,\s*CAP'
     r'|\n'
     r'|\s+con\s+sede'
-    r'|\s+sede\s+legale'   # "NOME sede legale Via..." senza "con" (es. bando Martini Montecatini)
+    r'|\s+sede\s+legale'   # "NOME sede legale Via..." senza "con"
     r'|,\s*[Ii]talia\b'
     r'|\s*[Ii]ndirizzo\b'
     r'|\s+\d{5}\b'
@@ -44,14 +83,14 @@ _DELIMITATORI_STRADALI = (
     r'|\s+[Ll]argo\s'
     r'|\s+[Ll]ocalit[aà]\'?\s'
     r'|\s+[Ll]oc\.\s'
-    r'|\s+[Ss]trada\s'      # via per esteso "Strada Querciolare" (es. bando fagiani ATC)
-    r'|\s+C/da\s'          # contrada abbreviata (es. bando Marliana)
+    r'|\s+[Ss]trada\s'      # via per esteso "Strada Querciolare"
+    r'|\s+C/da\s'          # contrada abbreviata 
     r'|\s+[Cc]ontrada\s'
 )
 
 _FINE_MANIFESTANTI = [
     r'Numero\s+(?:di\s+)?(?:operatori\s+|soggetti\s+|OO\.?\s*EE\.?\s+)?(?:economici\s+)?(?:pre\s+)?(?:invitati|selezionati|estratti\s+a\s+sorte)',  # OO.EE. es. bando mensa San Marcello; estratti a sorte es. bando Serra Carmignano; "soggetti invitati" es. esito-210
-    r'Operatori\s+economici\s+con\s+manifestazione',  # es. bando 101
+    r'Operatori\s+economici\s+con\s+manifestazione',
     r'Numero\s+(?:di\s+)?offerte\s+(?:ricevute|pervenute)',
     r'Data\s+(?:di\s+)?spedizione',
     r'Nome\s+e[d]?\s+indirizzo\s+dell.aggiudicatario',
@@ -69,9 +108,9 @@ _FINE_OFFERTE = [
 ]
 
 # Classe di caratteri per i nomi delle offerte
-# Include ':' (Fix P6), '+_,;' per nomi composti (bando 61, 64 ecc.)
+# Include ':', '+_,;' per nomi composti
 # Classe di caratteri per i nomi delle offerte
-# Include ':' (Fix P6), '+_,;' per nomi composti (bando 61, 64 ecc.)
+# Include ':', '+_,;' per nomi composti
 # Include '()' per gestire nomi come (SO.GE.R.T.)
 _CLS_OFF = r'[A-Za-z0-9\s\'\.\-–&+_,;:\"()àèìòùÀÈÌÒÙ\/]'
 # ── Helper generici ───────────────────────────────────────────────────────────
@@ -82,7 +121,7 @@ def estrai_sezione(testo, pattern_inizio, pattern_fine_list):
     pattern_inizio e termina prima del pattern_fine che compare PIÙ VICINO
     nel testo (posizione minima tra tutti i marcatori, non ordine della lista:
     con l'ordine della lista un marcatore lontano poteva vincere su uno vicino
-    facendo sconfinare la sezione — es. bando mensa San Marcello).
+    facendo sconfinare la sezione).
     Restituisce stringa vuota se pattern_inizio non corrisponde.
     """
     m = re.search(pattern_inizio, testo, re.IGNORECASE)
@@ -118,19 +157,19 @@ def _pulisci_nome(nome, taglia_indirizzi=False):
     nome = re.sub(r'^[-–]\s+', '', nome)
     # Toglie la precisazione societaria che alcune ragioni sociali portano in coda tra
     # virgolette ("TIPIESSE S.P.A. \"Società Unipersonale soggetta ad attività di direzione
-    # e coordinamento HBS Srl\"" -> "TIPIESSE S.P.A.", es. Esito-180). Solo code lunghe:
+    # e coordinamento HBS Srl\"" -> "TIPIESSE S.P.A."). Solo code lunghe:
     # le virgolette brevi sono parte della denominazione e vanno conservate
-    # ("ISTITUTO PROFESSIONALE \"L. EINAUDI\"", es. Esito-171).
+    # ("ISTITUTO PROFESSIONALE \"L. EINAUDI\"").
     nome = re.sub(r'\s*["“«][^"”»]{25,}["”»]\s*$', '', nome).strip()
     # (?:[\s,;]+|(?<=\.)): toglie la coda "P.IVA..." / "Partita IVA..." quando è separata
-    # dal nome da spazi, da una virgola ("SRL ,P.IVA:", es. bando esito_gara-4) o INCOLLATA
-    # dopo un punto ("ZOE S.C.S.P.IVA: IT-...", es. bando educativa Agliana). Copre anche
-    # "Partita IVA" scritto per esteso senza punti (es. bando esito_gara-4). Il contesto
+    # dal nome da spazi, da una virgola ("SRL ,P.IVA:") o INCOLLATA
+    # dopo un punto ("ZOE S.C.S.P.IVA: IT-..."). Copre anche
+    # "Partita IVA" scritto per esteso senza punti. Il contesto
     # prima dell'etichetta è obbligatorio, così nomi che iniziano con "PIVA"/"SPIVAK" e
     # sigle come "P.A." restano intatti.
     nome = re.sub(r'(?:[\s,;]+|(?<=\.))(?:Partita\s+IVA|[Pp]\.?\s*[Ii]\.?[Vv]\.?[Aa]\.?)\b.*$', '', nome).strip()
     # Coda "C.F. E P.I. ..." (codice fiscale e partita IVA coincidenti, un solo numero:
-    # "CCM FINOTELLO SRL C.F. E P.I. 02022820019", es. bando funivia Doganaccia PG5020).
+    # "CCM FINOTELLO SRL C.F. E P.I. 02022820019").
     # La regola sopra taglia solo a partire da "P.IVA"; qui la coda inizia col "C.F.".
     # Il lookahead pretende che dopo "C.F." segua "E P.I."/"E" finale o un codice, così
     # nomi legittimi come "C.F. COSTRUZIONI SRL" o "ALFA C.F.M. SRL" restano intatti.
@@ -138,8 +177,8 @@ def _pulisci_nome(nome, taglia_indirizzi=False):
         r'(?:[\s,;]+|(?<=\.))C\.?F\.?(?=\s*(?:[Ee]\s*(?:P\.?\s?I|$)|[.:\s]*(?:IT-\s*)?[A-Z0-9]{8,}))[\s\S]*$',
         '', nome, flags=re.IGNORECASE
     ).strip()
-    # etichetta incollata direttamente dopo una LETTERA ("SRLP.IVA: IT-...",
-    # es. bando biblioteca Lamporecchio): qui il punto in "P.IVA" è obbligatorio,
+    # etichetta incollata direttamente dopo una LETTERA ("SRLP.IVA: IT-...):",
+    #qui il punto in "P.IVA" è obbligatorio,
     # per non troncare nomi che contengono "PIVA" come sequenza di lettere
     nome = re.sub(r'(?<=[A-Za-z])P\.IVA\b.*$', '', nome).strip()
     nome = re.sub(r'\s+\d{11}\s*$', '', nome).strip()
@@ -164,7 +203,7 @@ def _pulisci_offerta(nome):
         '', nome, flags=re.IGNORECASE
     )
     # Etichetta anagrafica agganciata in coda al nome ("INTESA SANPAOLO S.P.A.
-    # Codice fiscale", Esito-197): la riga offerta prosegue con "Codice fiscale
+    # Codice fiscale"): la riga offerta prosegue con "Codice fiscale
     # NNN, P.Iva NNN" che il pattern trascina nel nome. Si taglia l'etichetta.
     nome = re.sub(r'\s+(?:Codice\s+fiscale|C\.?F\.?|P\.?\s*Iva|Partita\s+IVA)\s*$',
                   '', nome, flags=re.IGNORECASE)
@@ -191,8 +230,8 @@ def _unisci_membri_raggruppamento(testo_sez):
     Unisce alla voce precedente le righe dei MEMBRI di un raggruppamento, quando la voce è
     aperta da una sigla (ATI/RTI/RTP/RTS/ATP) e i membri sono elencati su righe proprie:
         "ATI ROSI LEOPOLDO S.P.A. Via Giuseppe Giusti, 67 ... C.F. 00820700474
-         CMB ENGINEERING SRL Viale Montegrappa, 276 ... C.F. 02385520974"
-    (es. bando ponte Ombrone Esito-176). Il PDF dichiara UNA offerta — l'ATI — ma senza
+         CMB ENGINEERING SRL Viale Montegrappa, 276 ... C.F. 02385520974".
+    Il PDF dichiara UNA offerta — l'ATI — ma senza
     l'unione la riga del membro viene letta come una seconda offerta.
 
     Nessun join esistente copre il caso: gli altri helper richiedono che la riga precedente
@@ -222,21 +261,17 @@ def _unisci_parola_spezzata_dopo_trattino(testo_sez):
     il nome di un membro di raggruppamento introdotto dal trattino:
         "ATI E.CO.RES. S.R.L. ... C.F. 04804621219 - GREEN
          WOOD SRL SP 27 KM 0.900 ... P.IVA -08173150726, C.F. 08173150726"
-    (es. bando polo scolastico San Giusto, Esito-174: "GREENWOOD" spezzato in "GREEN"+"WOOD").
-    Le due parti vanno attaccate SENZA spazio, altrimenti il nome risulta "GREEN WOOD".
 
     Nessun join esistente copre il caso: il join sul trattino di legatura richiede che la
     riga finisca col trattino, mentre qui finisce con una parola tronca; e
     _unisci_continuazioni_a_lettera non scatta perché la riga precedente ha già un codice.
     Senza l'unione la continuazione viene letta come una voce autonoma e la lista offerte
-    esce con un frammento in più ("WOOD SRL SP 27 KM 0.900, SN -").
+    esce con un frammento in più.
 
     La condizione è volutamente stretta — la riga precedente deve finire con " - PAROLA"
     (il trattino che introduce il membro), la successiva iniziare con maiuscole e portare
     un codice — perché unire senza spazio è distruttivo se applicato a righe spezzate tra
-    parole intere (es. esito-134, "... DI COOPERATIVE\\nSOCIALI ...", che vanno unite CON
-    lo spazio e sono già gestite altrove). Verificata su tutti i bandi della suite: tocca
-    solo il caso per cui è nata.
+    parole intere.
     """
     righe = testo_sez.split('\n')
     out = []
@@ -260,20 +295,18 @@ def _unisci_continuazioni_a_lettera(testo_sez):
 
     Serve per il wrap che spezza la voce a metà indirizzo o a metà ragione sociale lasciando
     la seconda parte a iniziare con una parola: "4. Camillo Sirianni ... (CZ), 88049 Loc.\\n
-    Scaglioni 30, C.F. 01932130790, e P.I. ..." (es. bando arredi Montale, esito_gara-6),
-    "10. CENTRO LEGNO AMBIENTE ... SOC. COOP.\\nA. F. P.IVA: ..." (es. esito_1-3) o
+    Scaglioni 30, C.F. 01932130790, e P.I. ..." ,
+    "10. CENTRO LEGNO AMBIENTE ... SOC. COOP.\\nA. F. P.IVA: ..."  o
     "1. COOPERATIVA TERRITORIO AMBIENTE MONTANO ACQUACHETA RABBI\\n(C.T.A.) SCA P.IVA: ..."
-    (es. bando Buggiano esito-170, dove la continuazione inizia con la parentesi di una
-    sigla). I join basati su regex coprono solo le continuazioni che iniziano con cifre
+    I join basati su regex coprono solo le continuazioni che iniziano con cifre
     (CAP/civico) o direttamente col codice, quindi queste resterebbero staccate: la voce
     perderebbe la propria P.IVA e i pattern che la pretendono sulla stessa riga la
     salterebbero, o ne estrarrebbero solo il frammento finale.
 
     La condizione "la riga precedente non ha un codice" è ciò che rende l'unione sicura:
-    nelle liste dove ogni voce ha già il suo codice (es. Esito-158, voci senza numero tipo
-    "Alioth ... P.IVA/C.F. 02197770502") nessuna riga viene unita. La condizione "la riga
-    porta un codice" evita di assorbire le code descrittive ("(Piccola Impresa)" di
-    esito-168). Elaborato riga per riga e non con re.sub, perché lì la scansione riparte a
+    nelle liste dove ogni voce ha già il suo codice nessuna riga viene unita. La condizione "la riga
+    porta un codice" evita di assorbire le code descrittive.
+    Elaborato riga per riga e non con re.sub, perché lì la scansione riparte a
     metà riga dopo ogni sostituzione e il gruppo che dovrebbe contenere la riga precedente
     arriva vuoto, aggirando il controllo.
     """
@@ -305,7 +338,7 @@ def _preprocessa_sezioni_std(testo):
     """
     # Normalizza l'etichetta "CF E PI" (codice fiscale e partita IVA coincidenti, un solo
     # numero) nella forma canonica "C.F. E P.I.": alcuni bandi la scrivono senza punti
-    # ("CCM FINOTELLO SRL CF E PI 02022820019", es. bando funivia Doganaccia PG5020),
+    # ("CCM FINOTELLO SRL CF E PI 02022820019"),
     # forma che nessun pattern a valle riconosce, lasciando il nome sporco e la P.IVA vuota.
     # Applicata al testo intero PRIMA del ritaglio, così vale per manifestanti, invitati,
     # offerte e aggiudicatario in un colpo solo. Il lookahead richiede cifre subito dopo,
@@ -318,20 +351,19 @@ def _preprocessa_sezioni_std(testo):
     # nella stessa forma canonica, così i pattern a valle la vedono già gestita.
     # Il lookahead richiede cifre subito dopo, quindi frasi come "P.IVA e CF sono
     # coincidenti" o nomi tipo "CFERRARI" non vengono toccati.
-    # es. bando decoro urbano Serravalle (Esito-160)
     testo = re.sub(r'\bP\.?\s?I\.?V?A?\.?\s+E\s+C\.?\s?F\.?(?=[\s:.,-]*\d)', 'C.F. E P.I.', testo,
                    flags=re.IGNORECASE)
 
     # Stessa etichetta coi due codici uniti dal TRATTINO invece che dalla "e"
-    # ("... SEMPLIFICATA C.F.-P.IVA: 03827870613", es. bando plesso Montecatini esito-172):
+    # ("... SEMPLIFICATA C.F.-P.IVA: 03827870613"):
     # senza normalizzarla il pattern aggancia il solo "P.IVA:" e il "C.F.-" resta appiccicato
     # in coda al nome. Il lookahead richiede cifre subito dopo, così non tocca i casi in cui
-    # il trattino precede le cifre di un codice ("P.IVA -02890290162" di esito-168).
+    # il trattino precede le cifre di un codice ("P.IVA -02890290162").
     testo = re.sub(r'\bC\.?F\.?\s*[-–]\s*P\.?\s?I\.?V?A?\.?(?=[\s:.,-]*\d)', 'C.F. E P.I.', testo,
                    flags=re.IGNORECASE)
 
     # Normalizza l'intestazione dell'aggiudicatario al PLURALE ("Nome e indirizzo degli
-    # aggiudicatari:", es. bando brokeraggio Massa e Cozzile Esito-156) nella forma
+    # aggiudicatari:") nella forma
     # singolare canonica: i delimitatori _FINE_*, il ritaglio della sezione e i pattern di
     # _estrai_aggiudicatario_std cercano tutti "dell'aggiudicatario", quindi col plurale
     # la sezione non veniva né delimitata né estratta. Normalizzando qui, sul testo intero
@@ -340,8 +372,7 @@ def _preprocessa_sezioni_std(testo):
                    r"\1dell'aggiudicatario", testo, flags=re.IGNORECASE)
 
     # Normalizza l'intestazione dell'aggiudicatario scritta TUTTA MAIUSCOLA ("NOME E
-    # INDIRIZZO DELL'AGGIUDICATARIO:", es. bando manutenzione SR435 esito_1-3, che ha
-    # tutte le intestazioni in maiuscolo). Il ritaglio della sezione e i delimitatori
+    # INDIRIZZO DELL'AGGIUDICATARIO:"). Il ritaglio della sezione e i delimitatori
     # _FINE_* cercano "Nome e indirizzo dell'aggiudicatario" in forma case-sensitive
     # (accettano solo "Nome"/"nome"), quindi col maiuscolo la sezione non veniva né
     # delimitata né estratta e l'aggiudicatario usciva "Non presente". Le altre sezioni
@@ -350,57 +381,53 @@ def _preprocessa_sezioni_std(testo):
                    r"Nome e indirizzo dell\1aggiudicatario", testo)
 
     # Rimuove il bullet tipografico usato come marcatore di elenco a inizio riga
-    # ("• TECHNOLOGICA S.R.L. ... P.IVA: 03136540402", es. bando SP20 Esito-171). I pattern
+    # ("• TECHNOLOGICA S.R.L. ... P.IVA: 03136540402"). I pattern
     # di estrazione sono ancorati a ^ e pretendono che la voce inizi con lettera o cifra:
     # col bullet non agganciano, il nome esce col simbolo e la P.IVA attaccata, e il campo
     # piva resta vuoto. Convertirlo in "- " non basta (anche il trattino blocca l'ancora):
     # va tolto. Solo a inizio riga, così i bullet decorativi a metà testo restano intatti,
-    # e senza toccare le liste che usano il trattino come marcatore (es. Esito-159).
+    # e senza toccare le liste che usano il trattino come marcatore.
     testo = re.sub(r'^(\s*)[•·▪◦‣∙]\s*', r'\1', testo, flags=re.MULTILINE)
 
     # Classificazione dimensionale infilata TRA l'etichetta e le cifre ("P.IVA Microimprese
-    # - 04804621219", es. bando polo scolastico San Giusto Esito-174): i pattern si aspettano
+    # - 04804621219"): i pattern si aspettano
     # le cifre subito dopo l'etichetta, quindi saltano quel codice e agganciano il successivo
     # — nel caso dell'ATI, la P.IVA del secondo membro invece che della capogruppo.
     # Il lookahead richiede le cifre dopo, così la stessa parola messa DOPO il codice
-    # ("P.I. 02802890612 Microimpresa", es. esito-172) non viene toccata.
+    # ("P.I. 02802890612 Microimpresa") non viene toccata.
     testo = re.sub(r'(P\.?\s?I\.?V?A?\.?[\s:]*)(?:Micro|Piccol|Medi|Grand)\w*\s*(?=[-–]?\s*\d{8,})',
                    r'\1', testo, flags=re.IGNORECASE)
 
-    # Etichetta "PIVA" senza punti ("... SOC.CONS. A R. L. PIVA: IT-01963870470", es. bando
-    # palestra Datini Esito-177, dove è l'unica voce su cinque a non avere "P.IVA:"): il
+    # Etichetta "PIVA" senza punti ("... SOC.CONS. A R. L. PIVA: IT-01963870470"): il
     # pattern delle offerte pretende il punto o il trattino dopo la P, quindi non la
     # riconosce e la voce si perde. Il lookahead richiede le cifre dopo (anche con "IT-"),
     # così non tocca né i testi in cui "PIVA" compare senza codice né il refuso già gestito
-    # "PIVA E CF" di Esito-155.
+    # "PIVA E CF".
     testo = re.sub(r'\bPIVA\b(?=[\s:.,-]*(?:IT-)?\d)', 'P.IVA', testo)
 
-    # Etichetta "P.IV" a cui manca la A ("MI.PA. COSTRUZIONI EDILI SRL P.IV/CF 07106311009",
-    # es. bando liceo Brunelleschi Esito-178, dove è l'unica voce su quindici col refuso):
+    # Etichetta "P.IV" a cui manca la A ("MI.PA. COSTRUZIONI EDILI SRL P.IV/CF 07106311009"):
     # i pattern accettano "IVA" per intero o "I" col punto, ma non "IV", quindi la voce si
     # perde sia tra gli invitati sia tra le offerte. Il contesto richiesto è stretto —
     # slash, sigla CF e cifre subito dopo — così non tocca testi in cui "P.IV" compaia
     # senza codice né l'ordine invertito "CF/P.IVA".
     testo = re.sub(r'\bP\.?IV(?=\s*/\s*C\.?F\.?[\s:.,-]*\d)', 'P.IVA', testo)
 
-    # Spazio mancante tra il nome e l'indirizzo ("ROSI LEOPOLDO S.P.A.Via Giuseppe Giusti",
-    # es. bando ponte Ombrone Esito-176): i delimitatori del nome cercano " Via "/" Piazza "
+    # Spazio mancante tra il nome e l'indirizzo ("ROSI LEOPOLDO S.P.A.Via Giuseppe Giusti"):
+    # i delimitatori del nome cercano " Via "/" Piazza "
     # con lo spazio davanti, quindi senza non scattano e l'indirizzo resta nel nome.
     # Richiede la maiuscola dopo, così non tocca gli indirizzi già separati né quelli
     # scritti in minuscolo o tutto maiuscolo dentro una riga.
     testo = re.sub(r'(?<=[a-zA-Z.])(Via|Viale|Piazza|Corso|Strada)\s+(?=[A-Z])', r' \1 ', testo)
 
     # Numero d'elenco con lo spazio dal lato sbagliato del separatore ("9 )Palandri e Belli
-    # S.r.l.P.IVA: ...", es. bando parcheggio Pieve a Nievole Esito-173, dove due voci su
-    # dieci hanno "N )NOME" invece di "N) NOME"). Il lookahead che protegge le voci numerate
+    # S.r.l.P.IVA: ...",  "N )NOME" invece di "N) NOME"). Il lookahead che protegge le voci numerate
     # e i pattern di estrazione si aspettano il separatore attaccato al numero: senza questa
     # normalizzazione quelle righe vengono scambiate per continuazioni e fuse nella
     # precedente, facendo sparire la voce dall'elenco.
     testo = re.sub(r'^(\s*\d{1,4})\s+([.)])', r'\1\2', testo, flags=re.MULTILINE)
 
     # Fix etichetta P.IVA mandata a capo INSIEME al codice: il PDF spezza la voce lasciando
-    # il nome sulla prima riga e "P.IVA/ C.F. 04876970486" tutta sulla seconda (es. bando
-    # servizi Serravalle, Esito-158, entry CO&SO dal nome molto lungo). Va ricongiunta alla
+    # il nome sulla prima riga e "P.IVA/ C.F. 04876970486" tutta sulla seconda. Va ricongiunta alla
     # riga precedente, altrimenti: nei manifestanti/invitati la riga-etichetta diventa una
     # voce spuria ("P.IVA/ C.F.") e il nome vero resta senza codice; nelle offerte la voce
     # non viene catturata affatto e si perde. Applicato al testo intero prima del ritaglio,
@@ -412,8 +439,8 @@ def _preprocessa_sezioni_std(testo):
         testo,
         # "Numero di operatori (economici) manifestanti" è la forma comune, ma alcuni bandi
         # usano "Manifestazioni di interesse pervenute: N" senza il prefisso "Numero..."
-        # (es. bando SP3 Acquerino, Provincia di Prato) oppure "Numero operatori economici
-        # che hanno manifestato interesse: n. N" (es. bando funivia Doganaccia, PG5020).
+        # oppure "Numero operatori economici
+        # che hanno manifestato interesse: n. N".
         # Prefisso opzionale, "pervenute" accanto a "ricevute".
         r'(?:Numero\s+(?:di\s+)?(?:operatori\s+)?(?:economici\s+)?)?'
         r'(?:manifestanti|che\s+hanno\s+manifestato\s+interesse'
@@ -423,8 +450,7 @@ def _preprocessa_sezioni_std(testo):
     )
     testo_sez_invitati = estrai_sezione(
         testo,
-        # "soggetti invitati": variante di etichetta (esito-210, Liceo Amedeo di
-        # Savoia) al posto di "operatori economici invitati".
+        # "soggetti invitati": variante di etichetta al posto di "operatori economici invitati".
         r'(?:Numero\s+(?:(?:di\s+)?(?:operatori\s+(?:economici\s+)?|soggetti\s+|OO\.?\s*EE\.?\s+))?(?:invitati|(?:pre\s+)?selezionati|estratti\s+a\s+sorte)'
         r'|Operatori\s+economici\s+(?:con\s+manifestazione\s+di\s+interesse\s+(?:completa\s+e\s+corretta\s+)?)?invitati)'
         r'[\s\S]{0,80}?\n',
@@ -432,12 +458,12 @@ def _preprocessa_sezioni_std(testo):
     )
     testo_sez_offerte = estrai_sezione(
         testo,
-        # "pervenute": variante di etichetta di esito-210.
+        # "pervenute": variante di etichetta.
         r'Numero\s+(?:di\s+)?offerte\s+(?:ricevute|presentate|pervenute)[\s\S]{0,80}?\n',
         _FINE_OFFERTE
     )
     # Sezione "offerte ammesse e valutate" come lista a sé: molti PDF elencano i nomi
-    # solo qui (sotto "ricevute" c'è il solo conteggio, es. bando Migliana Cantagallo).
+    # solo qui (sotto "ricevute" c'è il solo conteggio).
     # Estratta separatamente e restituita a parte; NON si travasa più nelle ricevute.
     testo_sez_ammesse = estrai_sezione(
         testo,
@@ -445,26 +471,26 @@ def _preprocessa_sezioni_std(testo):
         [r'Nome\s+e[d]?\s+indirizzo\s+dell.aggiudicatario', r'Numero\s+offerte\s+escluse']
     )
 
-    # Fix timestamp troncato a fine riga: "12:07:" → "12:07:00" (es. bando 94, entry 30)
+    # Fix timestamp troncato a fine riga: "12:07:" → "12:07:00"
     # Impedisce che il match lazy di pattern 6 sconfini nella riga successiva
     testo_sez_manifestanti = re.sub(
         r'(\d{2}:\d{2}:)\n', r'\g<1>00\n', testo_sez_manifestanti
     )
-    # Fix data+ora concatenate senza spazio: "15/10/202322:12:33" → "15/10/2023 22:12:33" (es. bando 96)
+    # Fix data+ora concatenate senza spazio: "15/10/202322:12:33" → "15/10/2023 22:12:33"
     testo_sez_manifestanti = re.sub(
         r'(\d{2}/\d{2}/\d{4})(\d{2}:\d{2}(?::\d{2})?)', r'\1 \2', testo_sez_manifestanti
     )
-    # Fix ora orfana su riga separata: "DD/MM/YYYY\nHH:MM:SS" → "DD/MM/YYYY HH:MM:SS" (es. bando 99)
+    # Fix ora orfana su riga separata: "DD/MM/YYYY\nHH:MM:SS" → "DD/MM/YYYY HH:MM:SS"
     # Impedisce che il "0" iniziale dell'ora venga letto come numero entry e il resto assorbito come nome
     testo_sez_manifestanti = re.sub(
         r'(\d{2}/\d{2}/\d{4})\s*\n\s*(\d{2}:\d{2}:\d{2})', r'\1 \2', testo_sez_manifestanti
     )
-    # Fix nome+data concatenati senza spazio: "S.R.L.05/08/2023" → "S.R.L. 05/08/2023" (es. bando 98)
+    # Fix nome+data concatenati senza spazio: "S.R.L.05/08/2023" → "S.R.L. 05/08/2023"
     # Impedisce che il lazy match di Pattern 5 scavalchi il newline e assorba la voce successiva
     # [-–]? scarta anche il trattino di legatura: "VASSALLO CALOGERO-04/10/2022"
-    # → "VASSALLO CALOGERO 04/10/2022" (es. bando verde Quarrata, esito-136)
-    # L'anno è 2-4 cifre: alcuni bandi usano l'anno breve attaccato ("MORANI SRL21/06/21",
-    # es. bando SP3 Acquerino), che va staccato prima della normalizzazione sotto.
+    # → "VASSALLO CALOGERO 04/10/2022"
+    # L'anno è 2-4 cifre: alcuni bandi usano l'anno breve attaccato ("MORANI SRL21/06/21"),
+    # che va staccato prima della normalizzazione sotto.
     testo_sez_manifestanti = re.sub(
         r'([A-Za-z\.])[-–]?(\d{2}/\d{2}/\d{2,4}\b)', r'\1 \2', testo_sez_manifestanti
     )
@@ -472,7 +498,7 @@ def _preprocessa_sezioni_std(testo):
     # l'anno breve ("17/06/21 11:33") mentre tutti i pattern manifestanti si aspettano l'anno
     # a 4 cifre come terminatore del nome. Senza normalizzare, la data resta attaccata al nome.
     # Agisce solo su "GG/MM/AA" seguito da un orario (HH:MM), così non tocca le date già a 4
-    # cifre né numeri non-data. es. bando SP3 Acquerino (Provincia di Prato)
+    # cifre né numeri non-data.
     testo_sez_manifestanti = re.sub(
         r'\b(\d{2}/\d{2}/)(\d{2})\b(?=\s*\d{1,2}:\d{2})', r'\g<1>20\g<2>', testo_sez_manifestanti
     )
@@ -495,7 +521,7 @@ def _preprocessa_sezioni_std(testo):
     if sum(1 for r in _righe_m if re.match(r'\s*[-–]\s+\S', r)) >= 2:
         testo_sez_manifestanti = re.sub(r'\n(?!\s*[-–]\s)(?=\S)', ' ', testo_sez_manifestanti)
 
-    # Normalizza virgolette tipografiche: " " → " " (es. bando 98: "ICG" S.R.L.)
+    # Normalizza virgolette tipografiche: " " → " "
     testo_sez_manifestanti = testo_sez_manifestanti.replace('“', '"').replace('”', '"')
     # Fix concatenazioni di fine pagina: pdfplumber a volte non inserisce
     # newline tra l'ultima riga di una pagina e la prima della successiva.
@@ -504,22 +530,22 @@ def _preprocessa_sezioni_std(testo):
         r'(\d{2}:\d{2}:\d{2})\s*(\d{2,4}(?=\s)|\d+\.)', r'\1\n\2', testo_sez_manifestanti
     )
     # → "manifestazione di interesse del\n22/01/2025" (page break tra "del" e la data):
-    #   pattern 1 non riesce a matchare; unisce la data alla riga precedente (es. bando 75, entry 117)
+    #   pattern 1 non riesce a matchare; unisce la data alla riga precedente
     testo_sez_manifestanti = re.sub(
         r'([Mm]anifestazione\s+(?:di\s+)?interesse\s+del)\s*\n\s*(\d{2}/\d{2}/\d{4})',
         r'\1 \2', testo_sez_manifestanti
     )
-    # → "22LA CITTADELLA S.N.C." (numero entry incollato al nome senza spazio, es. bando 83)
+    # → "22LA CITTADELLA S.N.C." (numero entry incollato al nome senza spazio)
     testo_sez_manifestanti = re.sub(
         r'^(\s*)(\d{1,3})([A-Z])', r'\1\2 \3', testo_sez_manifestanti, flags=re.MULTILINE
     )
     # → "XXXXXXXXXXX38 NOME" / "0208704067729. M.S.C." (invitati): numero entry attaccato
-    #   al C.F./P.IVA precedente, con o senza punto (es. bando 56, 72)
+    #   al C.F./P.IVA precedente, con o senza punto
     testo_sez_invitati = re.sub(
         r'(\d{11})\s*(\d{1,3}\.?\s+[A-Za-z])', r'\1\n\2', testo_sez_invitati
     )
     # → "FINDATA SRLS6. studio legale" (invitati): numero entry incollato alla fine
-    #   del nome precedente (page break senza newline, es. bando 56)
+    #   del nome precedente (page break senza newline)
     testo_sez_invitati = re.sub(
         r'([A-Za-z])(\d{1,2}\.)\s*(?=[A-Za-z])', r'\1\n\2 ', testo_sez_invitati
     )
@@ -544,60 +570,59 @@ def _preprocessa_sezioni_std(testo):
     testo_sez_manifestanti = re.sub(
         r';(\d+\.)', r';\n\1', testo_sez_manifestanti
     )
-    # Fix "NOME GG/MM/AAAA manifestazione del HH:MM:SS" → "NOME manifestazione del GG/MM/AAAA HH:MM:SS" (es. bando 102)
+    # Fix "NOME GG/MM/AAAA manifestazione del HH:MM:SS" → "NOME manifestazione del GG/MM/AAAA HH:MM:SS"
     # Evita che Pattern 1 assorba la data nel nome e Pattern 1b la conti come duplicato
     testo_sez_manifestanti = re.sub(
         r'(\d{2}/\d{2}/\d{4})\s+([Mm]anifestazione\s+del)\s+(\d{2}:\d{2}:\d{2})',
         r'\2 \1 \3', testo_sez_manifestanti
     )
-    # Fix nome su due righe: "NOME_PARTE1\nPARTE2 GG/MM/AAAA manifestazione" → riga singola (es. bando 103)
+    # Fix nome su due righe: "NOME_PARTE1\nPARTE2 GG/MM/AAAA manifestazione" → riga singola
     # Evita che Pattern 1c e 1e creino voci duplicate per la stessa azienda spezzata da un'interruzione di pagina
     testo_sez_manifestanti = re.sub(
         r"([A-Za-z'])\n([A-Za-z][^\n]+?\s+\d{2}/\d{2}/\d{4}\s+[Mm]anifestazione)",
         r'\1 \2', testo_sez_manifestanti
     )
-    # Fix "NOME GG/MM/AAAA manifestazione di interesse del HH:MM:SS" (es. bando 103, dopo il join a riga singola)
-    # Copre la variante con "di interesse" non gestita dal fix bando 102, e tollera "delHH:" senza spazio
+    # Fix "NOME GG/MM/AAAA manifestazione di interesse del HH:MM:SS" (dopo il join a riga singola)
+    # Copre la variante con "di interesse" non gestita, e tollera "delHH:" senza spazio
     testo_sez_manifestanti = re.sub(
         r'(\d{2}/\d{2}/\d{4})\s+([Mm]anifestazione\s+di\s+interesse\s+del)\s*(\d{2}:\d{2}:\d{2})',
         r'\2 \1 \3', testo_sez_manifestanti
     )
-    # Join nome su due righe: "NOME_PARTE1\nPARTE2 manifestazione di interesse del DATE" (es. bando 106)
+    # Join nome su due righe: "NOME_PARTE1\nPARTE2 manifestazione di interesse del DATE"
     # Copre la variante in cui la seconda riga inizia col resto del nome + "manifestazione di interesse del DATE"
-    # (diverso dal join bando 103 dove la data precede "manifestazione")
+    # (diverso dal join dove la data precede "manifestazione")
     testo_sez_manifestanti = re.sub(
         r"([A-Za-z'-])\n\s*([A-Za-z][^\n]+?\s+[Mm]anifestazione\s+di\s+interesse\s+del\s+\d{2}/\d{2}/\d{4})",
         r'\1 \2', testo_sez_manifestanti
     )
     # Strip indirizzo stradale tra nome e "manifestazione": "NOME Via X N CITY manifestazione" → "NOME manifestazione"
     # Richiede numero civico (\d+) per evitare falsi positivi su nomi tipo "NUOVA VIA SRL" (senza numero)
-    # [^\n]+? lazy per gestire vie multi-parola: "Via Don Luigi Sturzo 15 Pistoia" (es. bando 106)
+    # [^\n]+? lazy per gestire vie multi-parola: "Via Don Luigi Sturzo 15 Pistoia"
     testo_sez_manifestanti = re.sub(
         r'\s+(?:Via|Viale|Piazza|Corso|Largo)\s+[^\n]+?\s+\d+\s+\S+(?=\s+[Mm]anifestazione)',
         ' ', testo_sez_manifestanti
     )
-    # Safety net finale: normalizza "N. NOME" → "N NOME" a inizio riga (es. bando 105)
+    # Safety net finale: normalizza "N. NOME" → "N NOME" a inizio riga
     # Eseguito DOPO tutti i fix che possono generare nuovi \n (es. fix del ";", fix fine pagina),
     # così intercetta anche i "10." che finiscono a inizio riga solo dopo quei fix.
     # (?:\s+|(?=[A-Za-z"])): gestisce anche il punto INCOLLATO al nome senza spazio
-    # ("3.CRISTOFORO", es. bando educativa Agliana); lookahead solo su lettere per
+    # ("3.CRISTOFORO"); lookahead solo su lettere per
     # non toccare eventuali numeri decimali a inizio riga.
     testo_sez_manifestanti = re.sub(
         r'^(\s*)(\d+)\.(?:\s+|(?=[A-Za-z"]))', r'\1\2 ', testo_sez_manifestanti, flags=re.MULTILINE
     )
-    # Fix P.IVA su riga separata: "P.IVA:\nVALUE" → "P.IVA: VALUE" (es. bando 109)
+    # Fix P.IVA su riga separata: "P.IVA:\nVALUE" → "P.IVA: VALUE"
     # Evita che la riga del valore P.IVA diventi un "numero entry" spurio per Pattern 4
     # (?:IT-\s*)? copre anche l'a-capo DENTRO la P.IVA, dopo il prefisso IT-
-    # ("P.IVA: IT-\n09743130156", es. bando brokeraggio Massa e Cozzile, Esito-156):
+    # ("P.IVA: IT-\n09743130156"):
     # senza questo, la riga di continuazione diventa una voce spuria e sfasa tutta la lista.
     testo_sez_manifestanti = re.sub(
         r'(P\.IVA:?\s*(?:IT-\s*)?)\n\s*(\d{8,11})',
         r'\1\2', testo_sez_manifestanti, flags=re.IGNORECASE
     )
-    # Fix C.F. su riga separata: "C.F.:\nVALUE" → "C.F.: VALUE" (es. bando 109)
+    # Fix C.F. su riga separata: "C.F.:\nVALUE" → "C.F.: VALUE"
     # I due punti sono opzionali: il wrap può cadere anche dopo un "C.F." nudo
-    # ("... Via Vincenzo Gioberti 26, C.F.\n91007700478, e P.I. ...", es. bando cani
-    # randagi Monsummano, Esito_signed-4). Senza, la riga di continuazione diventa una voce
+    # ("... Via Vincenzo Gioberti 26, C.F.\n91007700478, e P.I. ..."). Senza, la riga di continuazione diventa una voce
     # a sé e il nome estratto è un frammento del codice ("7700478, e P.I.").
     # Stessa forma già usata dal fix gemello nel blocco invitati.
     testo_sez_manifestanti = re.sub(
@@ -609,19 +634,19 @@ def _preprocessa_sezioni_std(testo):
     testo_sez_manifestanti = re.sub(
         r'\s+C\.F\.:\s*\S+', '', testo_sez_manifestanti, flags=re.IGNORECASE
     )
-    # Fix data trailing negli invitati senza P.IVA: "0001 NOME GG/MM/AAAA" → "0001 NOME" (es. bando 102)
+    # Fix data trailing negli invitati senza P.IVA: "0001 NOME GG/MM/AAAA" → "0001 NOME"
     # Permette a Fallback 4 (nome a fine riga) di estrarre anche le entry con data in coda
     testo_sez_invitati = re.sub(
         r'^(\s*\d+[.)]?\s+[A-Za-z][^\n]*?)\s+\d{2}/\d{2}/\d{4}\s*$',
         r'\1', testo_sez_invitati, flags=re.MULTILINE
     )
     # Fix parola concatenata dopo apostrofo in invitati (page break senza spazio):
-    # "SOCIETA'COOPERATIVA" → "SOCIETA' COOPERATIVA" (es. bando 103)
+    # "SOCIETA'COOPERATIVA" → "SOCIETA' COOPERATIVA"
     testo_sez_invitati = re.sub(r"([A-Z]{3,}')([A-Z]{3,})", r'\1 \2', testo_sez_invitati)
-    # Fix nome su due righe in invitati: "NOME_PARTE1\nPARTE2 P.IVA" → riga singola (es. bando 103)
+    # Fix nome su due righe in invitati: "NOME_PARTE1\nPARTE2 P.IVA" → riga singola
     # Permette al regex P.IVA principale di catturare anche le entry spezzate da un'interruzione di pagina.
     # Il lookahead negativo evita il join quando la prima riga contiene già una P.IVA/P.I.:
-    # in quel caso è un'entry completa (es. C.F. alfanumerico a fine riga, bando Serravalle)
+    # in quel caso è un'entry completa (es. C.F. alfanumerico a fine riga)
     testo_sez_invitati = re.sub(
         r"^(?!.*P\.\s?(?:IVA|I))(.*[A-Za-z'])\n([A-Za-z][^\n]+?\s*P\.IVA)",
         r'\1 \2', testo_sez_invitati, flags=re.MULTILINE
@@ -634,21 +659,21 @@ def _preprocessa_sezioni_std(testo):
     # agganciano la riga di continuazione e restituiscono un pezzo d'indirizzo come nome.
     # Unisce solo righe che contengono un codice C.F./P.I. e non sono una nuova voce.
     # Il lookahead protegge tutte le forme di voce numerata usate dai bandi: "N. NOME",
-    # "N) NOME", "N NOME" senza punto (es. "1 ETT S.R.L. P.IVA..." di Esito-138/145),
-    # "N.NOME" col numero attaccato (es. "2.CSA ScpA P.IVA..." di esito-164), "N. 2NOME"
-    # con nome che inizia per cifra (es. "7. 2ZERO PROJECTS ..." di Esito-167) e
+    # "N) NOME", "N NOME" senza punto (es. "1 ETT S.R.L. P.IVA..." ),
+    # "N.NOME" col numero attaccato (es. "2.CSA ScpA P.IVA..."), "N. 2NOME"
+    # con nome che inizia per cifra (es. "7. 2ZERO PROJECTS ..." ) e
     # "N. . NOME" col punto orfano dopo il numero (es. "21. . VE.MA. Progetti ..." idem).
     # Col separatore (punto/parentesi) lo spazio è opzionale e si ammette un punto orfano;
     # senza separatore restano obbligatori sia lo spazio sia la lettera iniziale, altrimenti
     # un CAP di continuazione ("51100 Pistoia CF ...") o un codice nudo a capo
     # ("05260330872") verrebbero scambiati per nuove voci e i join legittimi salterebbero.
     # Unisce le continuazioni che iniziano con una lettera quando la riga precedente è
-    # troncata dal wrap ("10. CENTRO LEGNO AMBIENTE ... SOC. COOP.\nA. F. P.IVA: ...",
-    # es. bando manutenzione SR435 esito_1-3): senza, il nome estratto è il frammento
-    # finale ("A. F."). Stesso helper usato in _estrai_offerte_std (esito_gara-6); i join
+    # troncata dal wrap ("10. CENTRO LEGNO AMBIENTE ... SOC. COOP.\nA. F. P.IVA: ..."):
+    # senza, il nome estratto è il frammento finale ("A. F.").
+    # Stesso helper usato in _estrai_offerte_std (esito_gara-6); i join
     # a regex qui sotto coprono solo le continuazioni che iniziano con cifre o col codice.
     # Codice di 11 cifre a fine riga SENZA etichetta ("Euroimpianti Mazzoni s.r.l.
-    # 05794790484", es. bando cippato Marliana Esito_signed-5, dove due voci su dieci sono
+    # 05794790484", es. bando dove due voci su dieci sono
     # scritte così mentre le altre hanno "CF/P.iva"): gli estrattori usano l'etichetta come
     # àncora per riconoscere la voce, quindi senza si perdono e la riga viene fusa nella
     # successiva. Vi si aggiunge l'etichetta canonica.
@@ -671,12 +696,12 @@ def _preprocessa_sezioni_std(testo):
         r'(\s*\d{1,11}\b[^\n]*?(?:C\.F\.|P\.I\.)[^\n]*'
         # Dopo l'etichetta devono seguire davvero delle cifre: senza questo vincolo una
         # ragione sociale che INIZIA con "C.F." ("C.F.C. Consorzio fra costruttori
-        # soc.coop. ...", es. bando barriere SP Esito-179) viene scambiata per una
+        # soc.coop. ...") viene scambiata per una
         # continuazione e fusa nella voce precedente, sparendo dall'elenco.
         r'|\s*(?:C\.F\.|e\s+P\.I\.|P\.I\.)[\s:.,-]*(?:IT-\s*)?[A-Z0-9]{8,}[^\n]*)',
         r' \1', testo_sez_invitati, flags=re.IGNORECASE
     )
-    # Fix P.IVA su riga separata in invitati (es. bando 109) — stesso fix del blocco manifestanti
+    # Fix P.IVA su riga separata in invitati — stesso fix del blocco manifestanti
     testo_sez_invitati = re.sub(
         r'(P\.IVA:?\s*(?:IT-\s*)?)\n\s*(\d{8,11})',
         r'\1\2', testo_sez_invitati, flags=re.IGNORECASE
@@ -686,41 +711,41 @@ def _preprocessa_sezioni_std(testo):
         r'(C\.F\.:\s*)\n(\s*\S+)',
         r'\1\2', testo_sez_invitati, flags=re.IGNORECASE
     )
-    # Entry con SOLO C.F. e nessuna P.IVA ("2ZERO PROJECTS S.R.L.T.P. C.F.: 01686400530",
-    # es. bando ponti esito-139): promuove il C.F. numerico a P.IVA prima dello strip,
+    # Entry con SOLO C.F. e nessuna P.IVA ("2ZERO PROJECTS S.R.L.T.P. C.F.: 01686400530"):
+    # promuove il C.F. numerico a P.IVA prima dello strip,
     # altrimenti la riga resta senza codice e l'entry si perde. Solo su righe senza P.IVA.
     # Il lookahead copre sia "P.IVA" per esteso sia "P.I." abbreviato: righe come
     # "... C.F. 00799960158, e P.I. 11991500015" hanno già la P.IVA vera e NON vanno
-    # promosse, altrimenti il C.F. la soppianta (es. bando tesoreria Montale, esito-153).
+    # promosse, altrimenti il C.F. la soppianta.
     testo_sez_invitati = re.sub(
         r'^(?![^\n]*P\.\s?I(?:VA)?[.:\s])([^\n]*?)\s+C\.F\.\s*:?\s*(\d{11})\b',
         r'\1 P.IVA: \2', testo_sez_invitati, flags=re.MULTILINE | re.IGNORECASE
     )
-    # Punto orfano dopo il numero d'elenco ("21. . VE.MA.", es. bando ponti esito-139)
+    # Punto orfano dopo il numero d'elenco ("21. . VE.MA.")
     testo_sez_invitati = re.sub(
         r'^(\s*\d+\.)\s*\.\s+', r'\1 ', testo_sez_invitati, flags=re.MULTILINE
     )
     # C.F. mandato a capo dal wrap del PDF ("...872C.F.\n05260330872\n32. Breng"):
     # riunisce l'etichetta col suo codice sulla riga precedente, così lo strip del
     # C.F. non lascia una riga-numero orfana che poi la deduplica scarta, facendo
-    # sparire l'entry (es. bando ponti esito-139, entry SG.INARCH)
+    # sparire l'entry.
     testo_sez_invitati = re.sub(
         r'(C\.F\.\s*:?)\s*\n\s*([A-Z0-9]{11,16})\b', r'\1 \2', testo_sez_invitati, flags=re.IGNORECASE
     )
     # Prefisso codice pratica "n. <ID> Nome" dopo il numero d'elenco
-    # ("1. n. 377491 C.R.M. Escavazioni S.r.l.", es. bando Migliana Cantagallo):
+    # ("1. n. 377491 C.R.M. Escavazioni S.r.l."):
     # rimuove il "n. NNNNNN" così il nome resta pulito.
     testo_sez_invitati = re.sub(
         r'^(\s*\d+[.)]\s*)n\.\s*\d{4,7}\s+', r'\1', testo_sez_invitati, flags=re.MULTILINE
     )
-    # Campi INVERTITI nel documento: "P.IVA: <codice fiscale alfanumerico> C.F.: <cifre>"
-    # (es. bando esito-137, entry GIOVANNI ORISTANIO): scambia i due valori così la
+    # Campi INVERTITI nel documento: "P.IVA: <codice fiscale alfanumerico> C.F.: <cifre>":
+    # scambia i due valori così la
     # P.IVA numerica torna sotto l'etichetta giusta prima dello strip del C.F.
     testo_sez_invitati = re.sub(
         r'(P\.IVA:?\s*)([A-Za-z]{6}[A-Za-z0-9]{10})(\s+C\.F\.:?\s*)(\d{11})\b',
         r'\1\4\3\2', testo_sez_invitati, flags=re.IGNORECASE
     )
-    # Strip C.F. dal testo invitati (causa "20. GRATTACASO" con numero-entry nel nome - es. bando 109)
+    # Strip C.F. dal testo invitati
     testo_sez_invitati = re.sub(
         r'\s+C\.F\.:\s*\S+', '', testo_sez_invitati, flags=re.IGNORECASE
     )
@@ -738,8 +763,7 @@ def _preprocessa_sezioni_std(testo):
 def _elenco_nomi_nudi(testo_sez):
     """
     Fallback per gli elenchi di operatori scritti come NOMI NUDI, uno per riga,
-    senza numerazione ne' data ne' anagrafica obbligatoria (es. Liceo Duca
-    d'Aosta / Salutati, Esito-206 e Esito-207, con 284/302 manifestanti).
+    senza numerazione ne' data ne' anagrafica obbligatoria.
     Le cascate di pattern standard, che si ancorano al numero di riga o
     all'anagrafica in coda, qui catturano solo la prima voce.
 
@@ -776,9 +800,9 @@ def _estrai_manifestanti_std(testo_sez):
     Restituisce lista di stringhe (non ancora passate a _pulisci_nome).
     """
     # 1. "0001 NOME manifestazione [di [interesse]] del"
-    #    ^\s* tolera indentazioni PDF; \s* cattura anche "0003GIANANTONIO" (bando 6)
-    #    "di interesse" interamente opzionale (bando 26: "manifestazione del")
-    #    \d{1,4}: gestisce 1 cifra (es. bando 90: "1 CO&SO-CONSORZIO") oltre al classico 4 cifre
+    #    ^\s* tolera indentazioni PDF; \s* cattura anche "0003GIANANTONIO"
+    #    "di interesse" interamente opzionale ("manifestazione del")
+    #    \d{1,4}: gestisce 1 cifra ("1 CO&SO-CONSORZIO") oltre al classico 4 cifre
     manifestanti = re.findall(
         r'^\s*\d{1,4}\s*([A-Za-z0-9"][A-Za-z0-9\s\'\.\-–&+_,;:"()àèìòùÀÈÌÒÙ\/]+?)\s*[Mm]anifestazione\s+(?:di\s+)?(?:interesse\s+)?del',
         testo_sez, re.MULTILINE
@@ -805,27 +829,25 @@ def _estrai_manifestanti_std(testo_sez):
         # 3. "0001 NOME [del] GG/MM/AAAA" — ancorato a inizio riga (^ + MULTILINE):
         # senza ancora, le cifre finali dell'ORARIO della riga precedente venivano
         # usate come numero d'elenco e il numero vero finiva nel nome
-        # (es. bando alloggi Carmignano: "…09:28:02\n0002 VIMA SRL del…")
+        # (es. "…09:28:02\n0002 VIMA SRL del…")
         # "del" opzionale e giorno anche a 1 cifra: nello stesso PDF convivono
         # "NOME 02/05/2024", "NOME del 06/05/2024" e "NOME 4/05/2024"
-        # (es. bando ponte SP9 Carmignano per la Provincia di Prato)
         # (?:\d{4}(?=[A-Za-z0-9])|\d{1,4}\s+) accetta il numero incollato al nome
         # senza spazio, anche quando il nome inizia con una CIFRA:
-        # "0003AQUASPORT" (es. bando piscina Carmignano), "00523C SRL" e
-        # "00952EMME EDILIZIA" (es. bando Museo Etrusco Carmignano).
-        # Il numero col PUNTO attaccato al nome ("3.CRISTOFORO", es. bando educativa
-        # Agliana) è normalizzato a monte dal safety net di _preprocessa_sezioni_std.
-        # (?!\n\s*\d): il nome può proseguire sulla riga successiva (nomi spezzati,
-        # es. bando Serra) ma NON scavalcare in una riga che inizia con cifre —
+        # "0003AQUASPORT" , "00523C SRL" e
+        # "00952EMME EDILIZIA".
+        # Il numero col PUNTO attaccato al nome ("3.CRISTOFORO")
+        # è normalizzato a monte dal safety net di _preprocessa_sezioni_std.
+        # (?!\n\s*\d): il nome può proseguire sulla riga successiva (nomi spezzati),
+        # ma NON scavalcare in una riga che inizia con cifre —
         # altrimenti una entry senza data (solo orario) ingoia la entry seguente
-        # (es. bando Museo Etrusco: CAPPELLI "…11:53:18" + ABITER)
+        # (es. "…11:53:18" + ABITER)
         # Giorno \d{1,3} (non \d{1,2}): tollera il refuso "del 112/09/2024" del PDF
-        # (giorno a 3 cifre, es. bando SP17-SP24 Lotto B, Esito-184, voce 0109
-        # LAUDANTE COSTRUZIONI SRL) che altrimenti fa scartare l'intera riga e
+        # (giorno a 3 cifre) che altrimenti fa scartare l'intera riga e
         # perdere l'operatore. Un giorno reale a 3 cifre non esiste: il pattern
         # allargato può solo recuperare righe che prima fallivano.
         # \s* (non \s+) prima di "del": tollera il refuso "del incollato al nome"
-        # senza spazio (es. "COBESCO SRLdel 04/09/2024", 5 voci in Esito-183) che
+        # senza spazio (es. "COBESCO SRLdel 04/09/2024", 5 voci) che
         # altrimenti lascia "del" attaccato in coda al nome estratto ("COBESCO
         # SRLdel"). Il "del" minuscolo seguito dalla data non è mai parte del
         # nome, quindi separarlo è sempre corretto.
@@ -835,7 +857,7 @@ def _estrai_manifestanti_std(testo_sez):
         )
         manifestanti = [m for m in manifestanti if 'offerta' not in m.lower()]
     if not manifestanti:
-        # 4. "N. NOME P.IVA:" — lista numerata con P.IVA nel testo (es. bando 23, 24)
+        # 4. "N. NOME P.IVA:" — lista numerata con P.IVA nel testo
         manifestanti = re.findall(
             r'^\s*\d+[.)]?\s*([A-Za-z0-9"][A-Za-z0-9\s\'\.\-–&+_,;:"()àèìòùÀÈÌÒÙ\/]+?)\s*P\.IVA\b',
             testo_sez, re.MULTILINE | re.IGNORECASE
@@ -869,7 +891,7 @@ def _estrai_manifestanti_std(testo_sez):
             testo_sez, re.MULTILINE
         )
     if not manifestanti:
-        # 9. Nessun numero di prefisso: "NOME manifestazione [di interesse] del DATE" (es. bando 106)
+        # 9. Nessun numero di prefisso: "NOME manifestazione [di interesse] del DATE"
         #    Usato come last resort dopo il join a riga singola e lo strip dell'indirizzo in preprocessing
         manifestanti = re.findall(
             r'^([A-Za-z0-9"][A-Za-z0-9\s\'\.\-–&+_,;:"()àèìòùÀÈÌÒÙ\/]+?)\s+[Mm]anifestazione\s+(?:di\s+)?(?:interesse\s+)?del',
@@ -877,7 +899,7 @@ def _estrai_manifestanti_std(testo_sez):
         )
         manifestanti = [m for m in manifestanti if 'offerta' not in m.lower()]
     # 1c. "0007 NOME" / "01 NOME" — nome senza data né timestamp (aggiuntivo, non fallback)
-    #     \d{1,4}: gestisce sia il formato 4 cifre (es. 0007) che 1-3 cifre (es. bando 83: 01 COS.BO SRL)
+    #     \d{1,4}: gestisce sia il formato 4 cifre (es. 0007) che 1-3 cifre
     m1c = re.findall(
         r'^\s*(?:\d{4}(?=[A-Za-z0-9])|\d{1,4}\s+)\s*([A-Za-z0-9"][A-Za-z0-9\s\'\.\-–&+_,;:"()àèìòùÀÈÌÒÙ\/]+?)\s*$',
         testo_sez, re.MULTILINE
@@ -889,17 +911,17 @@ def _estrai_manifestanti_std(testo_sez):
             # anche la SOLA PRIMA RIGA dei nomi multi-riga: il Pattern 3 può aver
             # catturato "PRIMA RIGA\nSECONDA RIGA" scavalcando l'a-capo, e qui la
             # prima riga fisica ricomparirebbe da sola creando un doppione dopo la
-            # pulizia (es. bando Serra Carmignano: TIPIESSE, BUA, C.S.S., E.A.CO.)
+            # pulizia (es. TIPIESSE, BUA, C.S.S., E.A.CO.)
             _visti1c.add(n.strip().upper().split('\n')[0].strip())
         for n in m1c:
             n_clean = n.strip()
-            # orario orfano a fine riga senza data ("NOME 11:53:18", refuso del PDF,
-            # es. bando Museo Etrusco Carmignano): lo rimuove dal nome
+            # orario orfano a fine riga senza data ("NOME 11:53:18", refuso del PDF):
+            # lo rimuove dal nome
             n_clean = re.sub(r'\s+\d{1,2}:\d{2}(?::\d{2})?\s*$', '', n_clean)
             # \d{1,2}: riconosce anche date malformate con giorno a 1 cifra ("4/05/2024"),
-            # altrimenti la riga verrebbe ri-aggiunta sporca (es. bando ponte SP9)
+            # altrimenti la riga verrebbe ri-aggiunta sporca
             # P\.IVA senza \b iniziale: riconosce anche l'etichetta INCOLLATA al nome
-            # ("ALCANTARA SRLP.IVA: IT-...", es. bando biblioteca Lamporecchio)
+            # ("ALCANTARA SRLP.IVA: IT-...")
             if (re.search(r'\d{1,2}/\d{2}/\d{4}', n_clean)
                     or re.search(r'manifestazione', n_clean, re.IGNORECASE)
                     or re.search(r'P\.IVA\b', n_clean, re.IGNORECASE)):
@@ -914,7 +936,7 @@ def _estrai_manifestanti_std(testo_sez):
     )
     if not manifestanti:
         # Fallback nomi puri: lista senza numerazione, senza data e senza P.IVA,
-        # un nome per riga (es. bando RSPP: "RSPP Firenze srl", "BEN srl"...).
+        # un nome per riga (es. "RSPP Firenze srl", "BEN srl"...).
         # Scarta righe di intestazione/rumore e quelle troppo corte.
         for riga in testo_sez.split('\n'):
             r = riga.strip()
@@ -983,11 +1005,11 @@ def _estrai_invitati_std(testo_sez):
 
     # — Tentativo P.IVA —
     # ^\s* tolera indentazioni PDF; \s* prima di P.IVA gestisce spazio assente
-    # Prefisso C.F. opzionale prima dell'etichetta: "C.F. e P.I.: NNN" (es. bando 111),
+    # Prefisso C.F. opzionale prima dell'etichetta: "C.F. e P.I.: NNN",
     # "CF/P.iva NNN" ordine invertito e "CF <codice fiscale> P.iva NNN" per le persone
-    # fisiche (es. bando Martini Montecatini)
-    # (?:\s*/\s*C\.?F\.?\.?)? accetta anche "P.IVA/C.F.", "P.IVA/ C.F.", "P.IVA/CF" (es. bando Serravalle)
-    # Tre tolleranze per i refusi del PDF (es. bando ponti Prato, Esito-155, entry RINA):
+    # fisiche
+    # (?:\s*/\s*C\.?F\.?\.?)? accetta anche "P.IVA/C.F.", "P.IVA/ C.F.", "P.IVA/CF"
+    # Tre tolleranze per i refusi del PDF:
     #   P[.\-]? — il punto dell'etichetta è opzionale ("PIVA E CF" invece di "P.IVA E CF");
     #             resta comunque richiesto "IVA"/"I." dopo la P, quindi nomi come "PISA"
     #             o "PI.MA." non vengono scambiati per etichette
@@ -995,7 +1017,7 @@ def _estrai_invitati_std(testo_sez):
     #   [,\s]*  — virgola spuria al posto della prima cifra del codice ("CF ,3746550102")
     # Il nome NON può scavalcare l'a-capo (spazio/tab ma non \n): i nomi spezzati veri
     # sono già uniti dal preprocessing, mentre una entry SENZA etichetta P.IVA
-    # inghiottiva quella successiva (es. bando ponte Camaioni: ARTEK + BUA)
+    # inghiottiva quella successiva
     _PFX_CF = r'(?:C\.?F\.?\s*(?:[Ee]\s+|/\s*|:?\s*[A-Za-z0-9]{16}\s+))?'
     _CLS_INV = r'[A-Za-z0-9 \t\'\.\-–&+_"(),;:/àèìòùÀÈÌÒÙ]'
     operatori = re.findall(
@@ -1004,15 +1026,14 @@ def _estrai_invitati_std(testo_sez):
     )
     if not operatori:
         # [-–]? : elenco puntato col TRATTINO invece della numerazione
-        # ("- CITTA' FUTURA S.C. P.IVA: ...", esito-210). Senza questo il
+        # ("- CITTA' FUTURA S.C. P.IVA: ..."). Senza questo il
         # trattino restava incollato al nome e il fallback non agganciava.
         operatori = re.findall(
             r'^\s*[-–]?\s*([A-Za-z0-9]' + _CLS_INV + r'+?)\s*' + _PFX_CF + r'P[.\-]?\s?(?:IVA|I\.?)(?:\s*/\s*C\.?F\.?\.?)?[.:\s]*(?:[Ee]\s+C\.?F\.?\s*)?[,\s]*(?:IT-\s*)?(\d{8,11})',
             testo_sez, re.MULTILINE | re.IGNORECASE
         )
     # Recupero etichetta OMESSA: "N. NOME: 11533421001" senza "P.IVA" nel testo
-    # (es. bando ponte Camaioni, entry CONSORZIO ARTEK). Aggiunge solo le righe
-    # la cui P.IVA non è già stata catturata.
+    # Aggiunge solo le righe la cui P.IVA non è già stata catturata.
     if operatori:
         _pive_gia = {p for _, p in operatori}
         for _mo in re.finditer(r'^\s*\d+[.)]\s*([A-Za-z][^\n:]+?):\s*(\d{11})\s*$',
@@ -1039,16 +1060,15 @@ def _estrai_invitati_std(testo_sez):
         for nome, piva in operatori:
             nome = nome.strip()
             # Se il nome contiene un CAP l'indirizzo è incorporato nella riga
-            # ("NOME Via/Loc./C-da ... CAP Città (PR) CF/P.IVA NNN", es. bando Marliana):
+            # ("NOME Via/Loc./C-da ... CAP Città (PR) CF/P.IVA NNN"):
             # taglia con i delimitatori stradali. Altrimenti resta grezzo come sempre.
             # Stesso trattamento se porta in coda una precisazione societaria tra virgolette
             # ("TIPIESSE S.P.A. \"Società Unipersonale soggetta ad attività di direzione e
-            # coordinamento HBS Srl\"", es. Esito-180), che va rimossa dalla ragione sociale.
+            # coordinamento HBS Srl\""), che va rimossa dalla ragione sociale.
             if re.search(r'\d{5}', nome) or re.search(r'["“«][^"”»]{25,}["”»]\s*$', nome):
                 nome = _pulisci_nome(nome, taglia_indirizzi=True)
             # Deduplica per coppia (nome, piva) e non per sola piva: due entry
             # diverse possono condividere la stessa P.IVA per refuso del documento
-            # (es. bando ponte Camaioni: F2 e IMPR.EMI.D. con piva identica)
             chiave = (nome.upper(), piva.strip())
             if chiave not in visti:
                 visti.add(chiave)
@@ -1073,21 +1093,21 @@ def _estrai_invitati_std(testo_sez):
             testo_sez, re.MULTILINE
         )
     if not invitati_senza_piva:
-        # Formato "N. NOME P.IVA: IT-..." (es. bando 23, 66)
+        # Formato "N. NOME P.IVA: IT-..."
         invitati_senza_piva = re.findall(
             r'^\s*\d+[.)]?\s*([A-Za-z0-9][A-Za-z0-9\s\'\.\-–&+_"(),;:/àèìòùÀÈÌÒÙ]+?)\s*P\.IVA\b',
             testo_sez, re.MULTILINE | re.IGNORECASE
         )
         invitati_senza_piva = [m.rstrip('. ').strip() for m in invitati_senza_piva]
     if not invitati_senza_piva:
-        # Classe estesa con +()/: raggruppamenti "A+B" (bando 64)
-        # \s* (non \s+) gestisce numero attaccato al nome senza spazio (bando 71)
+        # Classe estesa con +()/: raggruppamenti "A+B"
+        # \s* (non \s+) gestisce numero attaccato al nome senza spazio
         invitati_senza_piva = re.findall(
             r'^\s*\d+[.)]?\s*([A-Za-z0-9][A-Za-z0-9\s\'\.\-–&+_"(),;:/àèìòùÀÈÌÒÙ]+?)\s*$',
             testo_sez, re.MULTILINE
         )
     if not invitati_senza_piva:
-        # "N.? NOME GG/MM/AAAA" — lista numerata con data (es. bando 54)
+        # "N.? NOME GG/MM/AAAA" — lista numerata con data
         invitati_senza_piva = re.findall(
             r'^\s*\d+[.)]?\s*([A-Za-z0-9][A-Za-z0-9\s\'\.\-–&+_"(),;:/àèìòùÀÈÌÒÙ]+?)\s+\d{2}/\d{2}/\d{4}',
             testo_sez, re.MULTILINE
@@ -1095,7 +1115,6 @@ def _estrai_invitati_std(testo_sez):
         invitati_senza_piva = [m.strip() for m in invitati_senza_piva]
     if not invitati_senza_piva:
         # Nomi puri: nessun numero d'elenco, nessuna P.IVA, un nome per riga
-        # (es. bando RSPP: "RC Safety di Camerlingo Raffaele.", "BEN srl"...).
         # Scarta intestazioni e righe con data.
         for riga in testo_sez.split('\n'):
             r = riga.strip()
@@ -1126,8 +1145,8 @@ def _estrai_offerte_std(testo_sez):
     # Fix Q: timestamp concatenato all'entry successiva (page-break senza newline)
     # "10:02:572. NOME" → "10:02:57\n2. NOME"
     # "12:46:310002 NOME" → "12:46:31\n0002 NOME"
-    # "15:58:3002 NOME" → "15:58:30\n02 NOME" (entry 2-3 cifre, es. bando 83)
-    # "16:50:491 NOME"  → "16:50:49\n1 NOME"  (entry 1 cifra, es. bando 84)
+    # "15:58:3002 NOME" → "15:58:30\n02 NOME" (entry 2-3 cifre)
+    # "16:50:491 NOME"  → "16:50:49\n1 NOME"  (entry 1 cifra)
     testo_sez = re.sub(
         r'(\d{2}:\d{2}:\d{2})\s*(\d{4}\s+|\d{1,3}\s+(?=[A-Za-z])|\d+\.)', r'\1\n\2', testo_sez
     )
@@ -1141,8 +1160,7 @@ def _estrai_offerte_std(testo_sez):
     # mentre le altre righe sono "1. ", "3. " regolari. Senza normalizzare, Pattern 1 e
     # i fallback (che si aspettano "N." o "N ") saltano queste righe e le offerte si
     # perdono. Riporta "N ." -> "N." solo a inizio riga, cifra seguita dal punto: non
-    # tocca nomi con numeri interni (es. "ITALEDIL P.M. 93", "2P ASFALTI").
-    # es. bando esito_gara_3 (Via Ugo Foscolo, Poggio a Caiano)
+    # tocca nomi con numeri interni
     testo_sez = re.sub(r'^(\s*\d{1,4})\s+\.(?=\s|[A-Za-z])', r'\1.', testo_sez, flags=re.MULTILINE)
     # Fix wrap indirizzo dopo "N.": l'indirizzo di una voce va a capo lasciando appeso
     # il numero civico abbreviato "... Via Firenze N.\n30 amministrativa in FIRENZE...".
@@ -1151,41 +1169,38 @@ def _estrai_offerte_std(testo_sez):
     # fantasma ("amministrativa in FIRENZE ..."). Ricongiunge la continuazione alla
     # riga precedente SOLO quando questa termina con "N." (numero civico troncato) e
     # la successiva inizia con una cifra: non tocca liste numerate regolari.
-    # es. bando esito_gara-4 (strutture sportive scuola Mazzei, Poggio a Caiano)
     testo_sez = re.sub(r'(\bN\.)\n(\d)', r'\1 \2', testo_sez)
     # Fix nome spezzato dal wrap con trattino di legatura a fine riga: il PDF manda a capo
     # dentro un nome composto e lascia il trattino appeso ("...COOPERATIVE SOCIALI-\nSOCIETÀ'
     # COOPERATIVA SOCIALE P.IVA: ..."). La seconda riga porta la P.IVA, quindi senza
     # ricongiungerle la voce non viene catturata da nessun pattern e l'offerta si perde.
     # Unisce SENZA spazio (il trattino fa parte del nome) e solo se la riga seguente non è
-    # una nuova voce numerata. es. bando servizi SdS Area Pratese (Esito-157)
+    # una nuova voce numerata.
     testo_sez = re.sub(r'(-)\n(?!\s*(?:\d{1,4}[.)]\s*\.?\s*[A-Za-z0-9]|\d{1,4}\s+[A-Za-z]))(?=\S)', r'\1', testo_sez)
     # Fix numero d'elenco isolato su riga a sé: alcuni PDF mettono il numero e il punto
     # su una riga tutta loro, col nome sulla riga successiva ("1.\nCristoforo ... con sede
     # ...\n2.\nAlice ..."). Senza unirli, i pattern numerati (che vogliono "N. NOME" sulla
     # stessa riga) non agganciano il nome e le offerte si perdono. Unisce "N.\n" alla riga
     # seguente solo se questa inizia con una lettera: non tocca liste già su riga singola.
-    # es. bando esito_gara-5 (assistenza servizi scolastici, Montale)
     testo_sez = re.sub(r'^(\s*\d{1,3}\.)\s*\n(?=[A-Za-z])', r'\1 ', testo_sez, flags=re.MULTILINE)
     # Nello stesso formato, l'indirizzo/codici di una voce proseguono su una o più righe.
     # La continuazione può iniziare in vari modi:
     #   - "C.F. ..." / "e P.I. ..." / "P.I. ..."        (codici a capo)
     #   - "<piva>, e P.I. ..."                          (P.IVA a capo, es. esito_gara-5)
-    #   - "46, C.F. ... e P.I. ..."                     (numero civico a capo, es. esito-142)
-    #   - "86100 via conte rosso 32, C.F. ..."          (CAP+via+civico a capo, es. esito-144)
+    #   - "46, C.F. ... e P.I. ..."                     (numero civico a capo)
+    #   - "86100 via conte rosso 32, C.F. ..."          (CAP+via+civico a capo)
     # Ricongiunge alla riga precedente ogni riga di continuazione che contiene un codice
     # C.F./P.I. e o inizia con cifre (CAP/civico, eventualmente seguite da testo d'indirizzo)
     # o inizia direttamente col codice. Il negative lookahead esclude le nuove voci numerate
     # in tutte le forme usate dai bandi — "N. NOME", "N) NOME", "N NOME" senza punto
-    # (es. "2 GLI ALTRI ... P.IVA: ..." di Esito-154) e "N.NOME" col numero attaccato
-    # (es. "2.CSA ScpA ..." di esito-164) — così non si fondono voci distinte. Lo spazio
+    # (es. "2 GLI ALTRI ... P.IVA: ..." ) e "N.NOME" col numero attaccato
+    # (es. "2.CSA ScpA ..." ) — così non si fondono voci distinte. Lo spazio
     # dopo il numero è opzionale solo col separatore: senza, resta obbligatorio, altrimenti
     # un CAP di continuazione verrebbe scambiato per una nuova voce.
     # Ogni offerta resta su una riga unica e la cascata la tratta in modo uniforme, senza
     # che un fallback intermedio (spec. 6b) ne catturi solo alcune.
-    # es. bandi esito_gara-5, esito-142, esito-144
     # Unisce le continuazioni che iniziano con una lettera quando la riga precedente è
-    # troncata dal wrap (es. "... 88049 Loc.\nScaglioni 30, C.F. ...", esito_gara-6):
+    # troncata dal wrap (es. "... 88049 Loc.\nScaglioni 30, C.F. ..."):
     # i join a regex qui sotto coprono solo quelle che iniziano con cifre o col codice.
     testo_sez = _unisci_parola_spezzata_dopo_trattino(testo_sez)
     testo_sez = _unisci_membri_raggruppamento(testo_sez)
@@ -1195,33 +1210,32 @@ def _estrai_offerte_std(testo_sez):
         r'(\s*\d{1,11}\b[^\n]*?(?:C\.F\.|P\.I\.)[^\n]*'
         # Dopo l'etichetta devono seguire davvero delle cifre: senza questo vincolo una
         # ragione sociale che INIZIA con "C.F." ("C.F.C. Consorzio fra costruttori
-        # soc.coop. ...", es. bando barriere SP Esito-179) viene scambiata per una
+        # soc.coop. ...") viene scambiata per una
         # continuazione e fusa nella voce precedente, sparendo dall'elenco.
         r'|\s*(?:C\.F\.|e\s+P\.I\.|P\.I\.)[\s:.,-]*(?:IT-\s*)?[A-Z0-9]{8,}[^\n]*)',
         r' \1', testo_sez, flags=re.IGNORECASE
     )
-    # Normalizza il terminatore "offerta del": maiuscolo "OFFERTA DEL" (es. bando 104),
-    # refuso del PDF "oferta del" con una sola f (es. bando teleriscaldamento Abetone)
+    # Normalizza il terminatore "offerta del": maiuscolo "OFFERTA DEL",
+    # refuso del PDF "oferta del" con una sola f
     # e "OFFERTA DEL" INCOLLATO al nome senza spazio ("COSTITUENDOOFFERTA DEL",
     # es. bando Dopo di Noi Larciano) — per questo niente \b iniziale.
     # Consente ai pattern case-sensitive "[Oo]fferta\s+del" di riconoscerlo sempre.
-    # Normalizza il terminatore "offerta del": maiuscolo "OFFERTA DEL" (es. bando 104),
-    # refuso del PDF "oferta del" con una sola f (es. bando teleriscaldamento Abetone),
-    # "offrta del" senza la e (es. bando ponti esito-139), e "OFFERTA DEL" INCOLLATO al
-    # nome senza spazio ("COSTITUENDOOFFERTA DEL", es. bando Dopo di Noi Larciano) —
-    # per questo niente \b iniziale.
+    # Normalizza il terminatore "offerta del": maiuscolo "OFFERTA DEL",
+    # refuso del PDF "oferta del" con una sola f,
+    # "offrta del" senza la e , e "OFFERTA DEL" INCOLLATO al
+    # nome senza spazio per questo niente \b iniziale.
     # Consente ai pattern case-sensitive "[Oo]fferta\s+del" di riconoscerlo sempre.
     testo_sez = re.sub(r'off?r?erta\s+del\b', 'offerta del', testo_sez, flags=re.IGNORECASE)
     testo_sez = re.sub(r'\boffrta\s+del\b', 'offerta del', testo_sez, flags=re.IGNORECASE)
     # "offerta del <parola> <data>": una parola si è infilata tra il terminatore e la
-    # data ("offerta del costituendo 08/02/2022", es. bando ponti esito-139). Riporta
+    # data ("offerta del costituendo 08/02/2022"). Riporta
     # la parola prima del terminatore così il nome la include e la data resta agganciata.
     testo_sez = re.sub(
         r'offerta\s+del\s+(costituendo)\s+(\d{2}/\d{2}/\d{4})',
         r'\1 offerta del \2', testo_sez, flags=re.IGNORECASE
     )
     # Terminatore "offerta del" OMESSO su una singola entry numerata, con la sola data
-    # ("16. IMPRENDO_MURARO RTI costituendo 08/02/2022 18:39:49", es. bando ponti esito-139):
+    # ("16. IMPRENDO_MURARO RTI costituendo 08/02/2022 18:39:49"):
     # lo inserisce prima della data, ma SOLO se altrove nella sezione "offerta del" esiste
     # (così non si tocca la cascata dei formati che di data-e-basta ne fanno il default).
     if re.search(r'offerta\s+del', testo_sez, re.IGNORECASE):
@@ -1229,13 +1243,13 @@ def _estrai_offerte_std(testo_sez):
             r'^(\s*\d+\.\s+(?:(?!offerta\s+del)[^\n])*?)\s+(\d{2}/\d{2}/\d{4}\s+\d{1,2}:)',
             r'\1 offerta del \2', testo_sez, flags=re.MULTILINE | re.IGNORECASE
         )
-    # Join nome su due righe in offerte: "NOME_PARTE1\nPARTE2 offerta del" → riga singola (es. bando 104)
+    # Join nome su due righe in offerte: "NOME_PARTE1\nPARTE2 offerta del" → riga singola
     # Evita che _pulisci_nome tronchi il nome al \n e che la seconda parte vada persa
     testo_sez = re.sub(
         r"([A-Za-z'])\n([A-Za-z][^\n]+?\s+offerta\s+del)",
         r'\1 \2', testo_sez, flags=re.IGNORECASE
     )
-    # Strip righe "e P.I. VALUE" e "P.I. VALUE" a inizio riga (es. bando 109)
+    # Strip righe "e P.I. VALUE" e "P.I. VALUE" a inizio riga
     # Queste righe sono continuazioni di codice fiscale, non nomi di offerenti;
     # se lasciate, Fallback 7 le cattura come nomi ("e P.I." / "P.I." dopo _pulisci_nome)
     testo_sez = re.sub(
@@ -1245,21 +1259,21 @@ def _estrai_offerte_std(testo_sez):
         r'^P\.I\.?\s+\d+.*$', '', testo_sez, flags=re.MULTILINE | re.IGNORECASE
     )
     # Strip righe che iniziano con "C.F." seguito dal codice (wrap dell'indirizzo su
-    # riga nuova: "C.F. 01538140623, e P.I. 01538140623", es. bando esito-137).
+    # riga nuova: "C.F. 01538140623, e P.I. 01538140623").
     # Senza strip, Fallback 7 le cattura come nomi scavalcando fino al "con sede"
     # dell'entry successiva, che sparisce. Il codice deve essere VERO: 11 cifre
     # (societario) oppure CF di persona fisica (6 lettere + 10 caratteri con almeno
     # una cifra DENTRO il blocco). Così i nomi d'azienda tipo "C.F.C. CONSORZIO..."
-    # (bando Pescia) o "C.F. COSTRUZIONI SRL" (sole lettere) restano intatti.
+    # o "C.F. COSTRUZIONI SRL" (sole lettere) restano intatti.
     testo_sez = re.sub(
         r'^C\.F\.?\s*:?\s*(?:\d{11}|[A-Z]{6}(?=[A-Z0-9]{0,9}\d)[A-Z0-9]{10})\b.*$', '', testo_sez,
         flags=re.MULTILINE | re.IGNORECASE
     )
     # Pattern 1: "NNNN NOME offerta del" — (?:\.|\s) accetta numerazione mista con/senza
-    # punto nella stessa lista ("1 BANCHELLI" + "2. ITALSCAVI", es. bando guado Settola)
+    # punto nella stessa lista ("1 BANCHELLI" + "2. ITALSCAVI")
     # senza agganciare righe che iniziano con una data; (?=[A-Z]) accetta il numero
-    # incollato al nome senza spazio ("0042M.V.RESILIENTI", es. bando alloggi Carmignano);
-    # (?:data)? scarta la data quando sta PRIMA di "offerta del" (es. bando teleriscaldamento Abetone)
+    # incollato al nome senza spazio ("0042M.V.RESILIENTI");
+    # (?:data)? scarta la data quando sta PRIMA di "offerta del"
     offerte = re.findall(
         r'^\s*\d{1,4}(?:\.|\s|(?=[A-Z]))\s*([A-Za-z0-9]' + _CLS_OFF + r'+?)\s*(?:\d{2}/\d{2}/\d{4}\s*)?[Oo]fferta\s+del',
         testo_sez, re.MULTILINE
@@ -1273,7 +1287,7 @@ def _estrai_offerte_std(testo_sez):
     if not offerte:
         # Fallback 3: "1. NOME offerta del" (\s* cattura anche "1.NOME" senza spazio)
         # (?:data)? scarta la data quando sta PRIMA di "offerta del" e l'ora dopo:
-        # "1. NOME 25/07/2022 offerta del 16:54:56" (es. bando teleriscaldamento Abetone)
+        # "1. NOME 25/07/2022 offerta del 16:54:56"
         offerte = re.findall(
             r'^\s*\d+\.\s*([A-Za-z0-9]' + _CLS_OFF + r'+?)\s*(?:\d{2}/\d{2}/\d{4}\s*)?[Oo]fferta\s+del',
             testo_sez, re.MULTILINE
@@ -1291,7 +1305,7 @@ def _estrai_offerte_std(testo_sez):
             testo_sez, re.MULTILINE
         )
     if not offerte:
-        # Fallback 6: "N. NOME-GG/MM/AAAA" separatore trattino (es. bando 66)
+        # Fallback 6: "N. NOME-GG/MM/AAAA" separatore trattino
         raw = re.findall(
             r'^\s*\d+\.\s*([\s\S]+?)-\s*\d{2}/\d{2}/\d{4}',
             testo_sez, re.MULTILINE
@@ -1300,17 +1314,15 @@ def _estrai_offerte_std(testo_sez):
             offerte = [n.replace('\n', ' ').strip() for n in raw if n.strip()]
     if not offerte:
         # Fallback 6b: "N. NOME P.IVA[:] <cifre> ..." — lista numerata dove il nome
-        # termina all'etichetta P.IVA (formato della sezione "ammesse e valutate", es.
-        # bando Migliana Cantagallo). Prima del Fallback 7 perché quest'ultimo, fermandosi
+        # termina all'etichetta P.IVA (formato della sezione "ammesse e valutate").
+        # Prima del Fallback 7 perché quest'ultimo, fermandosi
         # a "con sede", cattura solo le righe che ce l'hanno e sporca il nome col "P.IVA".
         # \s*[,;]?\s* ammette la virgola prima dell'etichetta ("SRL ,P.IVA:") e l'alternativa
-        # "Partita IVA" copre l'etichetta per esteso senza punti (es. bando esito_gara-4).
-        # [.:\s-]* ammette anche il trattino nudo tra etichetta e cifre ("P.IVA -02066400405",
-        # es. offerta RTI del bando sanzioni Pescia, Esito-148).
+        # "Partita IVA" copre l'etichetta per esteso senza punti.
+        # [.:\s-]* ammette anche il trattino nudo tra etichetta e cifre ("P.IVA -02066400405").
         # Il separatore dopo il numero è opzionale: alcune liste hanno voci senza punto
-        # ("2 GUTTORIELLO COSTRUZIONI SRL, con sede legale in Teano...", es. bando plesso
-        # Montecatini esito-172, dove è l'unica delle tre a non averlo). Senza, quella voce
-        # non veniva catturata e — trovando comunque le altre — il 6b bloccava i fallback
+        # ("2 GUTTORIELLO COSTRUZIONI SRL, con sede legale in Teano...", dove è l'unica delle tre a non averlo).
+        # Senza, quella voce non veniva catturata e — trovando comunque le altre — il 6b bloccava i fallback
         # successivi, lasciando la lista incompleta. Se il separatore manca, lo spazio è
         # obbligatorio, così il numero non si fonde col nome.
         offerte = re.findall(
@@ -1318,11 +1330,11 @@ def _estrai_offerte_std(testo_sez):
             testo_sez, re.MULTILINE | re.IGNORECASE
         )
     if not offerte:
-        # Fallback 7: "N. NOME[, con sede ...] GG/MM/AAAA" — numero iniziale opzionale (es. bando 55, 57, 86)
+        # Fallback 7: "N. NOME[, con sede ...] GG/MM/AAAA" — numero iniziale opzionale
         # La classe include le virgolette: alcune ragioni sociali portano una precisazione
         # tra virgolette prima della data ("TIPIESSE S.P.A. \"Società Unipersonale soggetta
-        # ad attività di direzione e coordinamento HBS Srl\" 08/09/2022", es. bando campo
-        # sportivo Esito-180); senza, il nome non arriva alla data e la voce si perde.
+        # ad attività di direzione e coordinamento HBS Srl\" 08/09/2022");
+        # senza, il nome non arriva alla data e la voce si perde.
         # La coda viene poi rimossa da _pulisci_nome.
         offerte = re.findall(
             r'^\s*(?:\d{1,3}\.?\s*)?([A-Za-z][A-Za-z0-9\s\'\"“”«»\.\-–&+_,;()àèìòùÀÈÌÒÙ]+?)'
@@ -1337,7 +1349,7 @@ def _estrai_offerte_std(testo_sez):
             testo_sez, re.MULTILINE
         )
     if not offerte:
-        # Fallback 9: "NNNN NOME" / "N. NOME" a fine riga, senza data né "offerta del" (es. bando 73)
+        # Fallback 9: "NNNN NOME" / "N. NOME" a fine riga, senza data né "offerta del"
         offerte = re.findall(
             r'^\s*\d{1,4}\.?\s+([A-Za-z0-9]' + _CLS_OFF + r'+?)\s*$',
             testo_sez, re.MULTILINE
@@ -1346,8 +1358,7 @@ def _estrai_offerte_std(testo_sez):
         # Fallback 9b: offerta su due righe, "NOME\nNazione Italia - Provincia ... - Città ...
         # - Indirizzo ...". Nessun numero d'elenco, nessuna etichetta P.IVA, nessun "offerta
         # del": l'unica ancora è la riga d'indirizzo che inizia con "Nazione". Il nome è la
-        # riga immediatamente precedente. es. bando riscossione coattiva Massa e Cozzile
-        # (Esito-151).
+        # riga immediatamente precedente.
         offerte = re.findall(
             r'^(.+?)\n\s*Nazione\b', testo_sez, re.MULTILINE
         )
@@ -1356,16 +1367,15 @@ def _estrai_offerte_std(testo_sez):
         # "RTP: <mandataria> (mandataria) - <membro> (mandante) - ..." eventualmente
         # spezzato su più righe, senza numero d'elenco né P.IVA né "offerta del".
         # È UNA sola offerta (il PDF dichiara n. 1): si estrae il capogruppo, coerentemente
-        # con la convenzione RTI degli altri bandi (es. Esito-148 "RTI MAGGIOLI SPA") e con
+        # con la convenzione RTI degli altri bandi e con
         # l'aggiudicatario, che per lo stesso testo dà "RTP: Rina Consulting Spa".
-        # es. bando ponti Prato (Esito-155)
         offerte = re.findall(
             r'^\s*((?:RT[PIS]|ATI)\s*:?\s*[^\n(]+?)\s*\((?:mandataria|capogruppo)\)',
             testo_sez, re.MULTILINE | re.IGNORECASE
         )
     if not offerte:
         # Fallback 9d: variante senza "(mandataria)" — "RTI costituendo: <capogruppo> CF NNN
-        # - <membro> CF NNN - ..." su più righe (es. bando servizi SdS Pistoiese, Esito-159).
+        # - <membro> CF NNN - ..." su più righe.
         # Il nome del capogruppo termina alla prima etichetta di codice. Anche qui è UNA
         # sola offerta e si estrae il capogruppo, come fa l'aggiudicatario sullo stesso testo.
         offerte = re.findall(
@@ -1375,7 +1385,7 @@ def _estrai_offerte_std(testo_sez):
     if not offerte:
         # Fallback 9e: voce di raggruppamento SENZA alcun codice, data o "con sede"
         # ("RTI COSTITUENDO SA.CA. S.R.L. -LUNARDI AMBIENTE E TERRITTORIO DI LUNARDI
-        # RICCARDO", es. bando accordo quadro strade Esito-175: il PDF elenca i codici solo
+        # RICCARDO": il PDF elenca i codici solo
         # più sotto, nelle righe Mandataria/Mandante dell'aggiudicatario). Tutti i pattern
         # precedenti mancano la voce e la lista esce vuota; il 9d non basta perché pretende
         # i due punti dopo "costituendo" e un'etichetta di codice a chiudere il nome.
@@ -1383,8 +1393,7 @@ def _estrai_offerte_std(testo_sez):
         # come per gli altri raggruppamenti. La guardia iniziale limita il fallback alle
         # righe SENZA codici — che è il caso per cui nasce: dove i codici ci sono, la voce
         # è già gestita dai pattern precedenti e qui il trattino separerebbe l'indirizzo,
-        # non il membro (es. "ATI E.CO.RES. S.R.L. VIA BENEDETTO CROCE, 43 - 80021
-        # AFRAGOLA...", Esito-174, dove senza guardia il nome si porterebbe dietro la via).
+        # non il membro
         offerte = re.findall(
             r'^\s*(?![^\n]*(?:C\.F\.|P\.\s?IVA|CF\b))'
             r'((?:RT[PIS]|ATI|ATP)(?:\s+costituendo)?\s*:?\s*[^\n-]+?)\s*[-–]\s*\S',
@@ -1392,15 +1401,14 @@ def _estrai_offerte_std(testo_sez):
         )
     if not offerte:
         # Fallback 10: "NOME P.IVA IT-NNN, C.F. NNN" — lista senza numerazione, senza data
-        # e senza "offerta del" (es. bando cimitero Pescia). Lavora riga per riga: ogni riga
+        # e senza "offerta del". Lavora riga per riga: ogni riga
         # con etichetta P.IVA+cifre è una voce; il nome è la riga ripulita da etichette e
         # codici. Gestisce anche "P.IVA/C.F." con slash e i raggruppamenti RTI con più
-        # aziende sulla stessa riga: "RTI: A P.IVA/C.F.NNN - B P.IVA/CF NNN" (es. bando Serravalle).
-        # Il prefisso C.F. accetta 11-16 caratteri: sia il CF societario (11 cifre, es. bando
-        # esito_gara-5) sia quello di persona fisica (16). L'etichetta P.IVA include anche
-        # "Partita IVA" per esteso (es. bando esito_gara-4). Tra etichetta e cifre è ammesso
+        # aziende sulla stessa riga: "RTI: A P.IVA/C.F.NNN - B P.IVA/CF NNN".
+        # Il prefisso C.F. accetta 11-16 caratteri: sia il CF societario (11 cifre)
+        # sia quello di persona fisica (16). L'etichetta P.IVA include anche
+        # "Partita IVA" per esteso. Tra etichetta e cifre è ammesso
         # anche un trattino nudo ("P.IVA -03140011200", separatore residuo quando manca "IT-",
-        # es. bando Esito-145 fornitura trattori).
         _lab_off = (
             r'[,;]?\s*(?:C\.?F\.?\s*(?:[Ee]\s+|/\s*|:?\s*[A-Za-z0-9]{11,16}\s+))?'
             r'(?:Partita\s+IVA|P[.\-]\s?(?:IVA|I\.?))(?:\s*/\s*C\.?F\.?\.?)?'
@@ -1411,15 +1419,15 @@ def _estrai_offerte_std(testo_sez):
                 nome = re.sub(_lab_off, '', riga, flags=re.IGNORECASE)
                 nome = re.sub(r'^\s*\d{1,4}[.)]?\s+', '', nome).strip(' ,;')
                 # CAP nel nome = indirizzo incorporato: taglia con i delimitatori
-                # stradali (es. bando Marliana). I nomi senza CAP restano intatti.
+                # stradali. I nomi senza CAP restano intatti.
                 if re.search(r'\d{5}', nome):
                     nome = _pulisci_nome(nome, taglia_indirizzi=True)
                 if nome:
                     offerte.append(nome)
             elif re.search(r'\(\s*RTI\b', riga, re.IGNORECASE) and re.search(r'\bCF\s*\d{8,11}', riga, re.IGNORECASE):
                 # Riga RTI senza etichetta "P.IVA" ma con "CF NNN" dentro le parentesi
-                # ("Cap&G consulting srl (RTI ... (CF 01756750624 - Isfel srl CF ...)",
-                # es. bando RSPP): il nome è la parte prima della parentesi dell'RTI.
+                # ("Cap&G consulting srl (RTI ... (CF 01756750624 - Isfel srl CF ...)"):
+                # il nome è la parte prima della parentesi dell'RTI.
                 nome = re.sub(r'\s*\(\s*RTI\b.*$', '', riga, flags=re.IGNORECASE).strip(' ,;')
                 if nome:
                     offerte.append(nome)
@@ -1437,10 +1445,10 @@ def _estrai_aggiudicatario_std(testo_aggiud_flat):
     # L'etichetta P.IVA è riconosciuta anche come "Partita IVA" per esteso (senza punti):
     # alcuni PDF scrivono "H.C. s.r.l. Partita IVA 02426680845 C.F. ..." invece di "P.IVA:".
     # Il nome termina in lookahead su "Partita IVA" (così non se la ingloba) e l'etichetta
-    # finale la include, agganciando le 11 cifre della P.IVA. (es. bando esito_gara-4)
+    # finale la include, agganciando le 11 cifre della P.IVA.
     #
     # Pattern 1a — P.IVA-first: quando la riga contiene SIA il C.F. SIA la P.IVA
-    # ("..., C.F. 00799960158, e P.I. 11991500015", es. bando tesoreria Montale esito-153),
+    # ("..., C.F. 00799960158, e P.I. 11991500015"),
     # va presa la P.IVA. Il pattern 1b sotto ha "C.F." come prima alternativa e, essendo il
     # C.F. scritto per primo nel testo, catturerebbe quello scambiandolo per partita IVA.
     # Questo tentativo cerca solo le etichette P.IVA/P.I./Partita IVA; se la riga ha
@@ -1448,42 +1456,41 @@ def _estrai_aggiudicatario_std(testo_aggiud_flat):
     _head_aggiud = (
         r"[Nn]ome\s+e[d]?\s+indirizzo\s+dell.aggiudicatario[:\s]*\s*"
         # Alcuni bandi introducono l'aggiudicatario come voce di elenco numerata
-        # ("1) DI DUCA COSTRUZIONI SRLP.IVA: ...", es. Esito-173): il numero va consumato,
+        # ("1) DI DUCA COSTRUZIONI SRLP.IVA: ..."): il numero va consumato,
         # altrimenti finisce nel nome ("1) DI DUCA COSTRUZIONI SRL").
         r"(?:\d{1,3}\s*[.)]\s*)?"
         r"(.+?)(?:,\s*con\s+sede|\s+con\s+sede|,\s*CAP|(?=\s+Partita\s+IVA\b)"
         # Nei raggruppamenti il PDF può elencare i membri con le etichette "Mandataria:" /
         # "Mandante:" dopo il nome dell'RTI ("RTI Costituendo SA.CA. S.R.L. -LUNARDI ...
-        # Mandataria: SA.CA. SRL Unipersonale - C.F.: ...", es. Esito-175): senza chiudere
+        # Mandataria: SA.CA. SRL Unipersonale - C.F.: ..."): senza chiudere
         # lì, il nome corre fino al primo codice e ingloba la riga della mandataria.
         r"|(?=\s+Mandatari[ao]\b)|(?=\s+Mandante\b)"
         # Il nome può essere incollato all'etichetta senza spazio né delimitatori
-        # ("DI DUCA COSTRUZIONI SRLP.IVA: IT-01995380605", es. Esito-173): senza chiudere
+        # ("DI DUCA COSTRUZIONI SRLP.IVA: IT-01995380605"): senza chiudere
         # anche sull'etichetta, il nome non si chiude mai e i pattern col codice non
         # agganciano, lasciando la piva vuota. Il prefisso "C.F./" va incluso nel
         # lookahead, altrimenti resta appiccicato in coda al nome quando l'etichetta è
-        # composta ("Exprit s.r.l. CF/P.IVA 02174300489", es. Esito-141).
+        # composta ("Exprit s.r.l. CF/P.IVA 02174300489").
         r"|(?=\s*(?:C\.?F\.?\s*/\s*)?P\.?\s?I(?:VA|\.)[\s:.-]*(?:IT-)?\d)"
         r"|\s+[Vv]ia(?:le)?\s|\s+[Pp]iazza\s|\s+[Cc]orso\s"
         # Il delimitatore " - " serve a tagliare le code tipo "ALFA SRL - Media impresa",
         # ma nei raggruppamenti il trattino introduce la prima impresa ("ATI - OLIMPIA
-        # COSTRUZIONI SRL via B. Dovizi...", es. bando pista atletica Casalguidi esito-168;
-        # "RTI: - Palandri e Belli S.r.l. via Michelangelo...", es. bando SP9 esito-169, dove
+        # COSTRUZIONI SRL via B. Dovizi..."
+        # "RTI: - Palandri e Belli S.r.l. via Michelangelo...", dove
         # la sigla ha i due punti ed è pure su una riga a sé prima dell'appiattimento):
         # lì tagliare lascerebbe come nome la sola sigla ("ATI", "RTI:"). I lookbehind
         # escludono il taglio quando il nome finora è solo una sigla di raggruppamento —
         # con o senza i due punti — così si ottiene "ATI - OLIMPIA COSTRUZIONI SRL" e
         # "RTI: - Palandri e Belli S.r.l.", coerenti con la convenzione sigla+capogruppo
-        # già usata per gli altri raggruppamenti (Esito-155 "RTP: Rina Consulting Spa",
-        # Esito-159 "RTI costituendo: Co&So ...").
+        # già usata per gli altri raggruppamenti 
         r"|(?<!\bATI)(?<!\bRTI)(?<!\bRTP)(?<!\bRTS)(?<!\bATP)"
         r"(?<!\bATI:)(?<!\bRTI:)(?<!\bRTP:)(?<!\bRTS:)(?<!\bATP:)"
         r"\s+[-–]\s+|\s*\()"
     )
     matches = re.findall(
         _head_aggiud +
-        # Il prefisso "IT-" davanti alle cifre compare in alcuni bandi ("P.IVA: IT-01995380605",
-        # es. bando parcheggio Pieve a Nievole Esito-173): senza ammetterlo nessun pattern
+        # Il prefisso "IT-" davanti alle cifre compare in alcuni bandi ("P.IVA: IT-01995380605"):
+        # senza ammetterlo nessun pattern
         # della cascata aggancia e scatta il fallback "solo nome", che restituisce il nome
         # sporco dell'intera riga e piva vuota.
         r"[\s\S]{0,150}?(?:Partita\s+IVA|P\.\s?I(?:VA|va)?\.?)[\s:]*[-–]?\s*(?:e\s+C\.?F\.?\s+)?(?:IT-\s*)?(\d{11})",
@@ -1499,7 +1506,7 @@ def _estrai_aggiudicatario_std(testo_aggiud_flat):
         )
     matches = [(n, p) for n, p in matches if len(n.strip()) > 2]
     if not matches:
-        # "NOME P.IVA[-: ]DIGITS" (bando 31, 44, 66)
+        # "NOME P.IVA[-: ]DIGITS"
         matches = re.findall(
             r"[Nn]ome\s+e[d]?\s+indirizzo\s+dell.aggiudicatario[:\s]*\s*"
             r"(.+?)\s+P\.?\s*I(?:va|VA)\.?[\s:–-]*(?:e\s+C\.?F\.?\s+)?(\d{11})",
@@ -1508,7 +1515,7 @@ def _estrai_aggiudicatario_std(testo_aggiud_flat):
         matches = [(n, p) for n, p in matches if len(n.strip()) > 2]
     if not matches:
         # "NOME CF/P.iva DIGITS indirizzo" — etichetta con slash attaccata subito dopo
-        # il nome, indirizzo DOPO la P.IVA (es. bando manto stradale Montale)
+        # il nome, indirizzo DOPO la P.IVA
         matches = re.findall(
             r"[Nn]ome\s+e[d]?\s+indirizzo\s+dell.aggiudicatario[:\s]*\s*"
             r"(.+?)\s*C\.?F\.?\s*/\s*P[.\-]?\s?I(?:VA|va)?\.?[\s:]*(\d{11})",
@@ -1516,7 +1523,7 @@ def _estrai_aggiudicatario_std(testo_aggiud_flat):
         )
         matches = [(n, p) for n, p in matches if len(n.strip()) > 2]
     if not matches:
-        # "NOME C.F./Codice fiscale NNNNN" (bandi 66, 67, 105, 108)
+        # "NOME C.F./Codice fiscale NNNNN"
         matches = re.findall(
             r"[Nn]ome\s+e[d]?\s+indirizzo\s+dell.aggiudicatario[:\s]*\s*"
             r"([A-Za-z][A-Za-z0-9\s\'\.\-–&àèìòùÀÈÌÒÙ]+?)\s+"
@@ -1532,7 +1539,7 @@ def _estrai_aggiudicatario_std(testo_aggiud_flat):
         )
         matches = [(n, p) for n, p in matches if len(n.strip()) > 2]
     if not matches:
-        # "NOME con sede ... C.F. e P.I. DIGITS" (es. bando 57)
+        # "NOME con sede ... C.F. e P.I. DIGITS"
         matches = re.findall(
             r"[Nn]ome\s+e[d]?\s+indirizzo\s+dell.aggiudicatario[:\s]*\s*"
             r"(.+?)(?:,?\s*con\s*sede)"
@@ -1561,10 +1568,8 @@ def _estrai_aggiudicatario_std(testo_aggiud_flat):
     if not matches:
         # Aggiudicatario SENZA alcuna P.IVA/C.F. nel blocco: cattura il solo nome,
         # delimitato dall'inizio dell'indirizzo; la piva resta vuota (-> "Non presente").
-        # Es. bando servizi cimiteriali Buggiano ("BERLOR ... Indirizzo VIA ROMA 127")
-        # e bando Faremo Foresta Carmignano ("EDILVERDE ..., con sede legale in ...").
         # Il trattino iniziale è opzionale: alcuni PDF introducono l'aggiudicatario come
-        # voce di elenco ("- TUTINO GROUP S.R.L.", es. bando SP20 Esito-171).
+        # voce di elenco ("- TUTINO GROUP S.R.L.").
         # Se manca anche l'indirizzo — il PDF dà solo il nome — il taglio avviene sulla
         # prima etichetta successiva del documento, altrimenti il nome si porterebbe
         # dietro tutto il resto della sezione.
@@ -1601,7 +1606,7 @@ def _estrai_singolo_lotto_std(testo, testo_sez_offerte, testo_aggiud_flat, testo
     }
 
     # Num offerte ricevute
-    # "pervenute": variante di etichetta di esito-210 (Liceo Amedeo di Savoia).
+    # "pervenute": variante di etichetta.
     match = re.search(r'Numero\s+(?:di\s+)?offerte\s+(?:ricevute|presentate|pervenute)[^\n]{0,50}?(\d+)', testo, re.IGNORECASE)
     if match:
         valore = match.group(1)
@@ -1611,8 +1616,7 @@ def _estrai_singolo_lotto_std(testo, testo_sez_offerte, testo_aggiud_flat, testo
     # Lista offerte
     lotto["offerte_ricevute"] = _estrai_offerte_std(testo_sez_offerte)
 
-    # Fallback ELENCO DI NOMI NUDI anche per le offerte (Esito-206/207: 159 e
-    # 185 dichiarate, nomi uno per riga senza numerazione). Scatta solo se il
+    # Fallback ELENCO DI NOMI NUDI anche per le offerte (nomi uno per riga senza numerazione). Scatta solo se il
     # dichiarato supera di molto quanto estratto dalla cascata.
     if (lotto["num_offerte_ricevute"] != "Non presente"
             and str(lotto["num_offerte_ricevute"]).isdigit()
@@ -1621,7 +1625,7 @@ def _estrai_singolo_lotto_std(testo, testo_sez_offerte, testo_aggiud_flat, testo
         _nudi_off = _elenco_nomi_nudi(testo_sez_offerte)
         if len(_nudi_off) > len(lotto["offerte_ricevute"]):
             lotto["offerte_ricevute"] = _nudi_off
-    # Elenco col TRATTINO e senza anagrafica (esito-210: "- Città Futura s.c.;"):
+    # Elenco col TRATTINO e senza anagrafica:
     # le cascate standard si ancorano alla numerazione o alla P.IVA e qui non
     # pescano nulla. La guardia sopra non copre il caso perche' richiede almeno
     # 5 offerte dichiarate; qui il riferimento e' il conteggio del PDF stesso e
@@ -1641,7 +1645,7 @@ def _estrai_singolo_lotto_std(testo, testo_sez_offerte, testo_aggiud_flat, testo
             lotto["offerte_ricevute"] = _tratti
 
     # Se il PDF non riporta il conteggio (header "Numero offerte ricevute" senza
-    # numero, seguito subito dalla lista — es. bando SP47 tangenziale est),
+    # numero, seguito subito dalla lista),
     # lo ricava dalla lunghezza della lista estratta
     if lotto["num_offerte_ricevute"] == "Non presente" and lotto["offerte_ricevute"]:
         lotto["num_offerte_ricevute"] = str(len(lotto["offerte_ricevute"]))
@@ -1652,14 +1656,14 @@ def _estrai_singolo_lotto_std(testo, testo_sez_offerte, testo_aggiud_flat, testo
         lotto["offerte_ammesse"] = _estrai_offerte_std(testo_sez_ammesse)
 
     # Offerte ammesse/escluse — conteggio sulla stessa riga dell'intestazione:
-    # il civico dell'aggiudicatario non diventa il conteggio (es. bando arredi esito-138)
+    # il civico dell'aggiudicatario non diventa il conteggio
     match = re.search(r'Numero offerte ammesse[^\n]{0,50}?(\d+)', testo, re.IGNORECASE)
     if match:
         lotto["num_offerte_ammesse"] = match.group(1)
     # Se manca il conteggio ma la lista ammesse è piena, lo ricava dalla lista
     if lotto["num_offerte_ammesse"] == "Non presente" and lotto["offerte_ammesse"]:
         lotto["num_offerte_ammesse"] = str(len(lotto["offerte_ammesse"]))
-    # "Numero di concorrenti esclusi": variante di etichetta (esito-210). Li'
+    # "Numero di concorrenti esclusi": variante di etichetta . Li'
     # il conteggio e' ripartito su due fasi ("documentazione amministrativa:0.
     # In fase di esame offerta tecnica: 1"): si prende l'ULTIMO numero della
     # riga, cioe' il totale degli esclusi a valle di entrambe le fasi.
@@ -1701,7 +1705,7 @@ def _estrai_singolo_lotto_std(testo, testo_sez_offerte, testo_aggiud_flat, testo
     # Valore offerta
     match = re.search(
         # "Importo contrattuale (valore dell'appalto) € ...": variante di
-        # etichetta di esito-210, dove manca del tutto "Valore dell'offerta".
+        # etichetta, dove manca del tutto "Valore dell'offerta".
         r"(?:Valore dell['']offerta[\s\S]{0,60}?|Importo di aggiudicazione[\s\S]{0,40}?"
         r"|Importo contrattuale[\s\S]{0,40}?)"
         r"(?:€|Euro)\s*([\d\.,]+)",
@@ -1735,7 +1739,7 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
     }
 
     # — CIG del lotto dal blocco di testata ("LOTTO A “Asfalti...” /
-    # CPV: ... / CIG: A03589F8C6", es. Ciclovia del Sole esito-187): pattern
+    # CPV: ... / CIG: A03589F8C6"): pattern
     # "temperato" che NON scavalca nel blocco del lotto successivo.
     m_cig = re.search(
         rf'LOTTO\s+{nome_lotto}\b(?:(?!\bLOTTO\s)[\s\S]){{0,250}}?CIG[.:\s]*([A-Z0-9]{{10}})\b',
@@ -1744,26 +1748,26 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
     if m_cig:
         lotto["cig_lotto"] = m_cig.group(1)
     else:
-        # Testata INVERTITA (es. esito-188): "CIG: LOTTO A A01EDD2441 /
+        # Testata INVERTITA: "CIG: LOTTO A A01EDD2441 /
         # LOTTO B A01EDDFEF8" — l'etichetta CIG precede i lotti e il codice
         # e' ADIACENTE al nome. Un token di 10 alfanumerici maiuscoli subito
         # dopo "LOTTO X" e' inequivocabilmente il suo CIG.
         # {10,11}: il CIG in testata puo' avere una lettera IN PIU' per refuso
-        # ("LOTTO B A01EF539010", 11 char = A01[E]F539010, esito-194). Si
+        # ("LOTTO B A01EF539010", 11 char = A01[E]F539010). Si
         # cattura fedelmente; l'aggancio col CIG vero di pagina (A01F539010)
         # avviene per SOTTOSEQUENZA in cig_compatibile.
         m_cig = re.search(rf'(?:LOTTO|Lotto)\s+{nome_lotto}\s+([A-Z0-9]{{10,11}})\b', testo)
         if m_cig:
             lotto["cig_lotto"] = m_cig.group(1)
         else:
-            # Terza variante di testata (es. Vernio esito-191): "CIG lotto 1:
+            # Terza variante di testat: "CIG lotto 1:
             # A031086993" — etichetta CIG prima, lotto minuscolo, due punti.
             m_cig = re.search(rf'CIG\s+lotto\s+{nome_lotto}\s*[.:\s]\s*([A-Z0-9]{{10}})\b',
                               testo, re.IGNORECASE)
             if m_cig:
                 lotto["cig_lotto"] = m_cig.group(1)
             else:
-                # "CIG Lotto 1 Lamporecchio 941376222B" (Esito-197): tra il numero
+                # "CIG Lotto 1 Lamporecchio 941376222B": tra il numero
                 # di lotto e il codice c'e' il nome del Comune. Si prende il primo
                 # token di 10 alfanumerici dopo "CIG Lotto N ... " fino al prossimo
                 # "CIG" o fine testata.
@@ -1821,7 +1825,7 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
     if offerte:
         lotto["offerte_ricevute"] = [_pulisci_offerta_ml(n) for n in offerte]
 
-    # — Lotto DESERTO nel ramo lettere (es. esito-194: "LOTTO B Deserto"
+    # — Lotto DESERTO nel ramo lettere (es. "LOTTO B Deserto"
     # nelle sezioni aggiudicatario e ribasso, ammesse "n° 0"): si marca qui
     # e a fine funzione i campi di aggiudicazione vengono forzati, perche'
     # senza guardia i fallback larghi copiavano ribasso e valore del lotto
@@ -1829,8 +1833,8 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
     if re.search(rf'LOTTO\s+{nome_lotto}\s+Deserto\b', testo, re.IGNORECASE):
         lotto["deserto"] = True
 
-    # — Manifestanti in sotto-blocchi "Lotto N" NUDI (es. Pieve a Nievole
-    # Esito-192): sezione manifestanti con sotto-intestazioni "Lotto N" e
+    # — Manifestanti in sotto-blocchi "Lotto N" NUDI:
+    # sezione manifestanti con sotto-intestazioni "Lotto N" e
     # righe "0001 NOME manifestazione di interesse del ...". Le chiavi del
     # lotto vengono create SOLO se il sotto-blocco esiste (gli altri PDF del
     # ramo ml restano identici).
@@ -1854,7 +1858,7 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
                 lotto["manifestanti"] = [{"nome": _pulisci_nome(n), "piva": "Non presente", "cf": "Non presente"}
                                          for n in _righe_m]
 
-    # — Offerte TAGGATE per lotto (es. esito-187: "1. FENIX ... 11/12/2023
+    # — Offerte TAGGATE per lotto (es. "1. FENIX ... 11/12/2023
     # 10:15:10 – Lotto A, Lotto B e Lotto C"): se le righe della sezione
     # offerte dichiarano i lotti, lista e conteggio del lotto si ricavano dai
     # tag e VINCONO sui pattern generici qui sopra.
@@ -1872,7 +1876,7 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
             lotto["num_offerte_ricevute"] = str(len(_mie))
 
     # — Offerte in SOTTO-BLOCCHI "LOTTO X n° N offerte" con righe SENZA
-    # "offerta del" (es. esito-188: "0001 BEMAR SRL 05/01/2024 10:46:56"):
+    # "offerta del" (es.  "0001 BEMAR SRL 05/01/2024 10:46:56"):
     # si ritaglia il sotto-blocco del lotto fino al lotto successivo e si
     # estraggono le righe numerate nome+data+ora.
     if not lotto["offerte_ricevute"] and _sez_off:
@@ -1882,12 +1886,12 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
         )
         if _m_sub:
             # \s* (non \s+) dopo il numero di riga: nel layer testuale di alcuni
-            # PDF il numero e' INCOLLATO al nome ("0001AURA S.R.L.", esito-189)
+            # PDF il numero e' INCOLLATO al nome ("0001AURA S.R.L.")
             # anche se a video lo spazio si vede.
             # Nome "temperato" (?:(?!\n\s*\d{4}\s)[\s\S])+? invece di (.+?):
             # le righe dei RAGGRUPPAMENTI vanno a capo ("0010 A.T.I.: AL.MA...
             # (mandataria) + F.LLI ZACCARIELLO S.R.L.\n(mandante) RTI
-            # costituendo data ora", esito-193) e il punto mono-riga perdeva
+            # costituendo data ora") e il punto mono-riga perdeva
             # la voce; il nome puo' proseguire sulla riga dopo ma NON invadere
             # una nuova riga numerata a 4 cifre.
             _righe = re.findall(
@@ -1897,14 +1901,14 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
             if _righe:
                 # _pulisci_offerta_ml (non _pulisci_nome): conserva la composizione
                 # dei RAGGRUPPAMENTI ("A.T.I.: AL.MA. ... (mandataria) + F.LLI
-                # ZACCARIELLO S.R.L. (mandante)", esito-193) togliendo solo il
+                # ZACCARIELLO S.R.L. (mandante)") togliendo solo il
                 # suffisso "RTI costituendo"; _pulisci_nome troncava alla mandataria.
                 lotto["offerte_ricevute"] = [_pulisci_offerta_ml(re.sub(r'\s+', ' ', n)) for n in _righe]
                 if lotto["num_offerte_ricevute"] == "Non presente":
                     lotto["num_offerte_ricevute"] = str(len(_righe))
 
     # — Offerte in sotto-blocchi "Lotto N:" con righe NON numerate
-    # "NOME offerta del data ora" (es. Vernio esito-191). Il confine col
+    # "NOME offerta del data ora" . Il confine col
     # lotto successivo puo' essere INCOLLATO alla riga precedente
     # ("...12:59:50Lotto 2:"), quindi niente ancora di inizio riga; \s*
     # prima di "offerta" tollera "S.R.L.offerta" (lotto 2).
@@ -1925,7 +1929,7 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
                     lotto["num_offerte_ricevute"] = str(len(_righe2))
 
     # — Offerte in sotto-blocchi "Lotto N" NUDI con righe numerate
-    # "0001 NOME offerta del ..." (quarta variante, Esito-192).
+    # "0001 NOME offerta del ..." (quarta variante).
     if not lotto["offerte_ricevute"] and _sez_off:
         _m_sub3 = re.search(
             rf'(?:^|\n)\s*Lotto\s+{nome_lotto}\s*\n([\s\S]*?)(?=\n\s*Lotto\s+[A-Z0-9]+\s*\n|\Z)',
@@ -1967,18 +1971,18 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
     match = re.search(
         rf'[Ll]otto\s+{nome_lotto}\s+'
         rf'([A-Za-z][A-Za-z0-9\s\'\.\-–&àèìòùÀÈÌÒÙ]+?)'
-        rf'(?:\s*,?\s*[Ss]ede\s+legale|\s*,?\s*[Cc]on\s+sede|\s*\()'  # ,? — "CvC Srl," con virgola prima di "con sede" (esito-188)
-        # "CF 0975..." (CADEL, esito-187): senza l'alternativa C.F./CF il motore
+        rf'(?:\s*,?\s*[Ss]ede\s+legale|\s*,?\s*[Cc]on\s+sede|\s*\()'  # ,? — "CvC Srl," con virgola prima di "con sede" 
+        # "CF 0975...": senza l'alternativa C.F./CF il motore
         # scavalcava nel blocco del lotto successivo rubandone la P.IVA
-        rf'[\s\S]{{0,200}}?(?:[Cc]odice\s+fiscale|C\.?F\.?(?:\s+e\s+P\.?I\.?)?)[.:\s]*(\d{{11}})'  # "C.F. e P.I. 0207..." (esito-188)
-        rf'(?:\s*e\s*P\.?\s*I\.?(?:VA)?\.?[.:\s]*(\d{{11}}))?',  # "C.F. X e P.I. Y" separati (Esito-192): la P.IVA vera e' la seconda
+        rf'[\s\S]{{0,200}}?(?:[Cc]odice\s+fiscale|C\.?F\.?(?:\s+e\s+P\.?I\.?)?)[.:\s]*(\d{{11}})'  # "C.F. e P.I. 0207..." 
+        rf'(?:\s*e\s*P\.?\s*I\.?(?:VA)?\.?[.:\s]*(\d{{11}}))?',  # "C.F. X e P.I. Y" separati: la P.IVA vera e' la seconda
         testo_aggiud_flat, re.IGNORECASE
     )
     if match:
         # taglia_indirizzi=False: il nome e' GIA' delimitato dal raccordo
         # "sede legale/con sede/(" del pattern; il taglio euristico amputava
         # i nomi che contengono parole-indirizzo ("Polisportiva calcio Via
-        # Nova ASD" -> "Polisportiva calcio", Esito-192).
+        # Nova ASD" -> "Polisportiva calcio").
         lotto["aggiudicatario_pdf"] = _pulisci_nome(match.group(1), taglia_indirizzi=False)
         lotto["aggiudicatario_piva"] = (match.group(3) or match.group(2)).strip()
     else:
@@ -2022,7 +2026,7 @@ def _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat):
         lotto["ribasso"] = f"{val}%"
 
     # Valore offerta: PRIMA l'adiacenza stretta "Lotto X € importo" (riparto per
-    # lotto, es. esito-187: "Lotto B € 376.978,98"); il pattern largo {0,100} da
+    # lotto, es. "Lotto B € 376.978,98"); il pattern largo {0,100} da
     # solo agganciava l'euro del lotto PRECEDENTE via riga dei ribassi.
     match = re.search(
         rf'[Ll]otto\s+{nome_lotto}\s*(?:€|Euro)\s*([\d\.,]+)',
@@ -2054,7 +2058,7 @@ def _estrai_multi_lotto_testata_puntata(testo, dati_pdf):
     Multi-lotto in formato standard con CIG in testata a elenco puntato
     "\u2022 Lotto 1 CIG 9404314D68 / \u2022 Lotto 2 CIG 940432567E" (lotto
     prima, poi "CIG", poi codice) e nel corpo N blocchi di aggiudicazione in
-    SEQUENZA, non etichettati per lotto (SdS Area Pratese, esito-199). I blocchi
+    SEQUENZA, non etichettati per lotto . I blocchi
     si agganciano ai lotti per POSIZIONE (1° blocco = Lotto 1, ...).
 
     Ritorna True se riconosce e popola i lotti, False altrimenti.
@@ -2110,11 +2114,11 @@ def _estrai_multi_lotto_righe_etichettate(testo, dati_pdf):
         "Ribasso offerto Lotto 1: 0,69%"
         "Valore dell'offerta Lotto 1: euro 40.570,01"
     I manifestanti nominativi seguono la riga di intestazione del proprio lotto.
-    Ponte Buggianese impianti sportivi 2019, Esito_F-2.
 
     Ritorna True se riconosce e popola i lotti, False altrimenti.
     """
     def _campo(etichetta, pattern_val):
+        """Raccoglie i valori di un campo etichettato, per numero di lotto."""
         return dict(
             (m.group(1), m.group(2).strip())
             for m in re.finditer(
@@ -2169,11 +2173,12 @@ def _estrai_multi_lotto_sezioni_globali(testo, dati_pdf):
     le sezioni; i lotti DESERTI ("Lotto 5: n. 0 Lotto deserto") e quelli
     senza aggiudicatario (offerta non ammessa, Lotto 7) sono gestiti.
     Nessun CIG nel PDF: i cig_lotto restano "Non presente" e arrivano dalla
-    pagina. Chiesina Uzzanese derrate alimentari, Esito-205 (9 lotti).
+    pagina.
 
     Ritorna True se riconosce e popola i lotti, False altrimenti.
     """
     def _sezione(inizio, fine):
+        """Ritaglia il testo compreso fra due espressioni, vuoto se assente."""
         m = re.search(rf'{inizio}[\s\S]*?(?={fine})', testo, re.IGNORECASE)
         return m.group(0) if m else ""
 
@@ -2197,8 +2202,8 @@ def _estrai_multi_lotto_sezioni_globali(testo, dati_pdf):
 
     # nomi con anagrafica in coda: "NOME CF/P.IVA 0044..." / "NOME P.IVA ... CF ..."
     # Il gruppo "coda" cattura i codici che seguono l'etichetta, cosi' la P.IVA
-    # puo' essere associata al nome invece di essere scartata (Esito-208).
-    # Tollera il refuso "/P,IVA" con la virgola (Esito-208, "Vivitoscano spl").
+    # puo' essere associata al nome invece di essere scartata.
+    # Tollera il refuso "/P,IVA" con la virgola
     _pat_nome = (r'^\s*(?P<nome>.+?)\s+'
                  r'(?P<etichetta>CF\s*/\s*P[.,]?\s*IVA|P[.,]?\s*IVA\s*/\s*CF|P[.,]?\s*IVA|CF)\b'
                  r'(?P<coda>.*)$')
@@ -2217,6 +2222,7 @@ def _estrai_multi_lotto_sezioni_globali(testo, dati_pdf):
         return m.group(1) if m else "Non presente"
 
     def _num(corpo):
+        """Estrae il numero da diciture come "n. 3"; "Non presente" se manca."""
         m = re.search(r'n\.?\s*(\d+)', corpo or "")
         return m.group(1) if m else "Non presente"
 
@@ -2227,8 +2233,8 @@ def _estrai_multi_lotto_sezioni_globali(testo, dati_pdf):
         _nomi_m = re.findall(_pat_nome, _manif.get(nl, ""), re.MULTILINE)
         _nomi_o = [] if _deserto else re.findall(_pat_nome, _c_off, re.MULTILINE)
         # marcatore "c.s." (come sopra) nella riga invitati del lotto: gli
-        # invitati coincidono con i manifestanti DI QUEL LOTTO (Esito-208,
-        # "Lotto 1: n.6 c.s"). Senza questo la lista invitati restava vuota.
+        # invitati coincidono con i manifestanti DI QUEL LOTTO.
+        # Senza questo la lista invitati restava vuota.
         _cs = bool(re.search(r'\bc\.?\s?s\.?(?:\s|$|\.)', _inv.get(nl, "") or ""))
 
         _a = re.sub(r'\s+', ' ', _agg.get(nl, "")).strip()
@@ -2270,7 +2276,6 @@ def _estrai_multi_lotto_aggiudicatari_elenco(testo, dati_pdf):
         "Lotto N NOME Codice fiscale NNN con sede legale ...", eventualmente
         con un lotto CONDIVISO ("Lotto 3 e 4 ASSURFINANCE ...");
       - ribasso e valore su righe "Lotto N X %" / "Lotto N euro Y".
-    Ponte Buggianese servizi assicurativi, Esito-204.
 
     Ritorna True se riconosce e popola i lotti, False altrimenti.
     """
@@ -2332,7 +2337,6 @@ def _estrai_multi_lotto_sezioni_maiuscole(testo, dati_pdf):
     proprio blocco invitati/offerte/aggiudicatario/valore, e CIG dichiarati
     in TESTATA in coda alla descrizione di ciascun lotto
     ("- LOTTO 1 - ... NUMERO GARA 7845252 CIG 8397632925;").
-    SDS Pistoiese, Esito-203.
 
     Ritorna True se riconosce e popola i lotti, False altrimenti.
     """
@@ -2424,7 +2428,6 @@ def _estrai_multi_lotto_cig_inline(testo, dati_pdf):
         "Valore dell'offerta: LOTTO 1 € 10.540,00 - LOTTO 2 € 11.658,61");
       - aggiudicatario, offerte e ammesse CONDIVISI tra i lotti (il PDF dice
         esplicitamente "per entrambi i lotti").
-    Chiesina Uzzanese/Uzzano, Esito-202.
 
     Ritorna True se riconosce e popola i lotti, False altrimenti.
     """
@@ -2447,10 +2450,10 @@ def _estrai_multi_lotto_cig_inline(testo, dati_pdf):
     _mn, _inv, sez_off, sez_amm, aggiud_flat = _preprocessa_sezioni_std(testo)
     comune = _estrai_singolo_lotto_std(testo, sez_off, aggiud_flat, sez_amm)
 
-    # "Nome e indirizzo dell'aggiudicatario PER ENTRAMBI I LOTTI: ALIOTH ..."
-    # (Esito-202): l'inciso che precede i due punti finisce nel nome. Si toglie
+    # "Nome e indirizzo dell'aggiudicatario PER ENTRAMBI I LOTTI: ALIOTH ...":
+    # l'inciso che precede i due punti finisce nel nome. Si toglie
     # qui, nel ramo, per non toccare _estrai_aggiudicatario_std condiviso coi
-    # 45 mono-lotto storici (verificato: l'inciso esiste solo in questo PDF).
+    # 45 mono-lotto storici
     _agg = comune.get("aggiudicatario_pdf", "Non presente")
     _agg = re.sub(r'^\s*per\s+entrambi\s+i\s+lotti\s*:\s*', '', _agg, flags=re.IGNORECASE)
 
@@ -2480,9 +2483,7 @@ def _estrai_multi_lotto_sezioni_titolo(testo, dati_pdf):
     "Lotto N \u2013 Titolo" (ognuna col proprio blocco offerte/aggiudicatario/
     ribasso/valore) e CIG dichiarati in TESTATA come "CIG: 9363570667 Lotto 1
     \u2013 Campi sportivi / 93635841F6 Lotto 2 \u2013 Palazzetto" (codice PRIMA,
-    lotto DOPO; l'etichetta CIG spesso solo sul primo). Ponte Buggianese
-    (Esito_ok). Gemello di 'multi_lotto_std' (Esito-185) ma senza CIG inline
-    e in formato standard.
+    lotto DOPO; l'etichetta CIG spesso solo sul primo).
 
     Ritorna True se riconosce e popola i lotti, False altrimenti.
     """
@@ -2546,7 +2547,7 @@ def _estrai_multi_lotto_testata_cig(testo, dati_pdf):
     """
     Multi-lotto in formato standard con lotti dichiarati SOLO in testata come
     "CIG: - lotto 1 Larciano 94103491A9 / - lotto 2 Lamporecchio 94103599E7"
-    (Esito-198) o "CIG Lotto 1 ... CIG Lotto 2 ..." (Esito-197), offerte per
+    o "CIG Lotto 1 ... CIG Lotto 2 ...", offerte per
     lotto in sotto-blocchi "LOTTO N:" e AGGIUDICAZIONE CONDIVISA (un unico
     aggiudicatario/ribasso/valore/ammesse per tutti i lotti).
 
@@ -2565,7 +2566,7 @@ def _estrai_multi_lotto_testata_cig(testo, dati_pdf):
     _mn, _inv, testo_sez_offerte, testo_sez_ammesse, testo_aggiud_flat = _preprocessa_sezioni_std(testo)
     comune = _estrai_singolo_lotto_std(testo, testo_sez_offerte, testo_aggiud_flat, testo_sez_ammesse)
 
-    # corpo per i sotto-blocchi "LOTTO N:" (offerte per lotto, Esito-198)
+    # corpo per i sotto-blocchi "LOTTO N:" (offerte per lotto)
     sez = re.search(
         r'offerte\s+ricevute\s*:?\s*\n([\s\S]*?)(?=Numero\s+offerte\s+ammesse|Nome\s+e\s+indirizzo|$)',
         testo, re.IGNORECASE
@@ -2578,7 +2579,7 @@ def _estrai_multi_lotto_testata_cig(testo, dati_pdf):
                       corpo, re.IGNORECASE)
         if m:
             # righe "N. NOME [data] offerta del [ora]": data/ora possono trovarsi
-            # PRIMA di "offerta del" (ordine anomalo, lotto 2 Esito-198), quindi
+            # PRIMA di "offerta del" (ordine anomalo), quindi
             # si taglia il nome al primo gruppo data o a "offerta".
             for riga in re.findall(r'^\s*\d+\.\s*(.+?)\s+offerta\s+del', m.group(1), re.MULTILINE | re.IGNORECASE):
                 riga = re.sub(r'\s+\d{1,2}/\d{2}/\d{4}.*$', '', riga)  # via data trascinata
@@ -2608,7 +2609,7 @@ def _estrai_multi_lotto_testata_cig(testo, dati_pdf):
 
 def _estrai_multi_lotto_testata_lotto_cig(testo, dati_pdf):
     """
-    Ramo dedicato C (Esito-209, campi sportivi Carmignano).
+    Ramo dedicato C .
 
     Testata con LOTTO PRIMA e CIG DOPO, una riga per lotto:
         Lotto 1 CIG 9204491A41
@@ -2642,7 +2643,7 @@ def _estrai_multi_lotto_testata_lotto_cig(testo, dati_pdf):
     _cig = _pat_testata.findall(testo)
     if len(_cig) < 2:
         return False
-    # Marcatori del corpo: servono a distinguere questo formato da Esito-204,
+    # Marcatori del corpo: servono a distinguere questo formato,
     # che ha la stessa testata ma sezioni completamente diverse (ed e' gia'
     # gestito dal suo ramo, piu' in alto nella cascata).
     if not (_pat_off.search(testo) and _pat_rib.search(testo) and _pat_val.search(testo)):
@@ -2707,13 +2708,13 @@ def _estrai_formato_standard(testo, dati_pdf, lotto_corrente, indice_lotto):
 
     # — Num manifestanti —
     # Stesse diciture riconosciute dall'estrazione della sezione: "manifestanti",
-    # "che hanno manifestato interesse" (es. bando funivia Doganaccia, PG5020) e
-    # "manifestazioni di interesse ricevute/pervenute" (es. bando SP3 Acquerino).
+    # "che hanno manifestato interesse"  e
+    # "manifestazioni di interesse ricevute/pervenute" .
     match = re.search(
         r'(?:Numero\s+(?:di\s+)?(?:operatori\s+)?(?:economici\s+)?)?'
         r'(?:manifestanti|che\s+hanno\s+manifestato\s+interesse'
         r'|manifestazioni\s+(?:di\s+)?interesse\s+(?:ricevute|pervenute))'
-        r'[^\n]{0,50}?(\d+)',  # stessa riga: senza numero in intestazione non pesca cifre dalla lista (es. bando arredi esito-138)
+        r'[^\n]{0,50}?(\d+)',  # stessa riga: senza numero in intestazione non pesca cifre dalla lista
         testo, re.IGNORECASE
     )
     if match:
@@ -2726,7 +2727,6 @@ def _estrai_formato_standard(testo, dati_pdf, lotto_corrente, indice_lotto):
         # avviene già nei merge additivi (1b/1c/1e) dentro _estrai_manifestanti_std.
         # A questo livello i duplicati sono manifestazioni AUTENTICHE ripetute nel
         # PDF (stessa azienda che manifesta due volte) e vanno conservate
-        # (es. bando Cartiere Collodi: LA FENICE e Tincolini presenti 2 volte).
         manifestanti_unici = []
         for nome in manifestanti:
             nome_pulito = _pulisci_nome(nome.strip())
@@ -2739,17 +2739,15 @@ def _estrai_formato_standard(testo, dati_pdf, lotto_corrente, indice_lotto):
                 # La P.IVA di una voce sta sempre sulla SUA riga: si cerca da dove inizia il
                 # nome fino al fine riga. Una finestra a lunghezza fissa non andrebbe bene in
                 # entrambi i sensi: troppo corta, manca la P.IVA quando il nome è seguito da
-                # un indirizzo lungo (es. bando cani randagi Monsummano, Esito_signed-4, dove
-                # il codice cade appena oltre i 100 caratteri); troppo lunga, sconfina nella
+                # un indirizzo lungo; troppo lunga, sconfina nella
                 # voce successiva e ne pesca la P.IVA. Il fine riga è il confine naturale.
                 _fine_riga = testo_sez_manifestanti.find('\n', _idx)
                 _vicino = (testo_sez_manifestanti[_idx:] if _fine_riga < 0
                            else testo_sez_manifestanti[_idx:_fine_riga])
                 # Etichetta P.IVA o P.I. (anche preceduta da "C.F. E", quando codice fiscale
-                # e partita IVA coincidono: "C.F. E P.I. 02022820019", es. bando PG5020).
+                # e partita IVA coincidono: "C.F. E P.I. 02022820019").
                 # (?:\s*/\s*C\.?F\.?\.?)? copre "P.IVA/C.F. 02197770502" e "P.IVA/ C.F. ..."
-                # con lo slash (es. bando servizi Serravalle, Esito-158), come già fa il
-                # pattern degli invitati.
+                # con lo slash, come già fa il pattern degli invitati.
                 _pm = re.search(
                     r'P\.\s?I(?:VA)?\.?(?:\s*/\s*C\.?F\.?\.?)?[.:\s]+(?:IT-\s*)?(\d{11})',
                     _vicino, re.IGNORECASE
@@ -2762,7 +2760,7 @@ def _estrai_formato_standard(testo, dati_pdf, lotto_corrente, indice_lotto):
 
     # — Fallback ELENCO DI NOMI NUDI (uno per riga, senza numerazione ne' data):
     # scatta solo se il conteggio DICHIARATO e' molto maggiore di quanto estratto
-    # dalle cascate (Esito-206/207: 284 e 302 dichiarati, 1 solo estratto).
+    # dalle cascate.
     _n_dich = dati_pdf.get("num_operatori_manifestanti", "Non presente")
     if (_n_dich != "Non presente" and str(_n_dich).isdigit()
             and int(_n_dich) >= 5
@@ -2777,10 +2775,9 @@ def _estrai_formato_standard(testo, dati_pdf, lotto_corrente, indice_lotto):
     match = re.search(
         r'(?:Numero\s+(?:di\s+)?(?:operatori\s+|soggetti\s+|OO\.?\s*EE\.?\s+)?(?:economici\s+)?(?:invitati|(?:pre\s+)?selezionati|estratti\s+a\s+sorte)'
         r'|Operatori\s+economici\s+(?:con\s+manifestazione\s+di\s+interesse\s+(?:completa\s+e\s+corretta\s+)?)?invitati)'
-        r'[^\n]{0,50}?(\d+)\s*(c\.?\s?s\.?\b|come\s+sopra)?',  # stessa riga (es. bando arredi esito-138)
+        r'[^\n]{0,50}?(\d+)\s*(c\.?\s?s\.?\b|come\s+sopra)?',  # stessa riga
         # Il marcatore "gli invitati sono gli stessi dei manifestanti" compare sia abbreviato
-        # ("n. 10 c.s.") sia per esteso ("n.1 come sopra", es. bando impianto sportivo Pescia
-        # Esito-161; "4 Come sopra", es. Esito-154): senza la forma estesa il travaso dai
+        # ("n. 10 c.s.") sia per esteso ("n.1 come sopra"): senza la forma estesa il travaso dai
         # manifestanti non scattava e la lista invitati restava vuota.
         testo, re.IGNORECASE
     )
@@ -2793,7 +2790,7 @@ def _estrai_formato_standard(testo, dati_pdf, lotto_corrente, indice_lotto):
     # — Lista invitati —
     dati_pdf["operatori_invitati"] = _estrai_invitati_std(testo_sez_invitati)
 
-    # La formula "Come sopra" su riga a se' (Esito_F-2: "Numero operatori
+    # La formula "Come sopra" su riga a se' ("Numero operatori
     # economici invitati: 3\nCome sopra") non e' un nome: va scartata, cosi'
     # il meccanismo e_come_sopra qui sotto puo' copiare i manifestanti.
     dati_pdf["operatori_invitati"] = [
@@ -2827,58 +2824,57 @@ def _estrai_formato_standard(testo, dati_pdf, lotto_corrente, indice_lotto):
             {"nome": m["nome"], "piva": m.get("piva", "Non presente"), "cf": m.get("cf", "Non presente")}
             for m in dati_pdf["operatori_manifestanti"]
         ]
-    # Intestazione invitati SENZA numero (la lista parte subito sotto, es. bando
-    # arredi esito-138): deriva il conteggio dalla lunghezza della lista estratta
+    # Intestazione invitati SENZA numero (la lista parte subito sotto:
+    # deriva il conteggio dalla lunghezza della lista estratta
     if dati_pdf["num_operatori_invitati"] == "Non presente" and dati_pdf["operatori_invitati"]:
         dati_pdf["num_operatori_invitati"] = str(len(dati_pdf["operatori_invitati"]))
 
     # — Rilevamento lotti —
     # Ramo dedicato A00000: ogni campo su riga propria con etichetta ripetuta
-    # e numero di lotto inline ("Ribasso offerto Lotto 1: ...", Esito_F-2).
+    # e numero di lotto inline ("Ribasso offerto Lotto 1: ...").
     if _estrai_multi_lotto_righe_etichettate(testo, dati_pdf):
         return
 
     # Ramo dedicato A0000: SEZIONI GLOBALI divise internamente per "Lotto N:"
     # (manifestanti/invitati/offerte/aggiudicatari/ribassi/valori), lotti
-    # deserti inclusi, nessun CIG nel PDF (Esito-205, 9 lotti).
+    # deserti inclusi, nessun CIG nel PDF.
     if _estrai_multi_lotto_sezioni_globali(testo, dati_pdf):
         return
 
     # Ramo dedicato A000: elenco aggiudicatari "Lotto N NOME Codice fiscale
     # NNN" (con lotti condivisi "Lotto 3 e 4") + offerte in sezioni
-    # "Lotto N. Titolo" + ribassi/valori per lotto su righe (Esito-204).
+    # "Lotto N. Titolo" + ribassi/valori per lotto su righe.
     if _estrai_multi_lotto_aggiudicatari_elenco(testo, dati_pdf):
         return
 
     # Ramo dedicato A00: sezioni "LOTTO N" (riga a se') autocontenute, CIG in
-    # coda alla descrizione di ciascun lotto in testata (Esito-203).
+    # coda alla descrizione di ciascun lotto in testata.
     if _estrai_multi_lotto_sezioni_maiuscole(testo, dati_pdf):
         return
 
     # Ramo dedicato A0: testata "CIG LOTTO N codice" ripetuta + ribasso/valore
-    # per lotto IN LINEA su una riga sola, resto condiviso (Esito-202).
+    # per lotto IN LINEA su una riga sola, resto condiviso.
     if _estrai_multi_lotto_cig_inline(testo, dati_pdf):
         return
 
     # Ramo dedicato A: sezioni autocontenute "Lotto N \u2013 Titolo" con CIG in
-    # testata (codice prima, lotto dopo), aggiudicazione PER LOTTO (Esito_ok).
+    # testata (codice prima, lotto dopo), aggiudicazione PER LOTTO.
     if _estrai_multi_lotto_sezioni_titolo(testo, dati_pdf):
         return
 
     # Ramo dedicato A2: testata a elenco puntato "Lotto N CIG codice" e blocchi
-    # sequenziali per lotto agganciati per posizione (esito-199).
+    # sequenziali per lotto agganciati per posizione.
     if _estrai_multi_lotto_testata_puntata(testo, dati_pdf):
         return
 
     # Ramo dedicato B: lotti in TESTATA con CIG ("- lotto 1 Comune CODICE") e
-    # aggiudicazione condivisa (Esito-197, Esito-198). Se lo riconosce, popola
+    # aggiudicazione condivisa. Se lo riconosce, popola
     # i lotti e termina; altrimenti prosegue col rilevamento standard.
     if _estrai_multi_lotto_testata_cig(testo, dati_pdf):
         return
 
     # Ramo dedicato C: testata "Lotto N CIG codice" (lotto prima, CIG dopo) con
     # sezioni per lotto miste, lotti deserti dichiarati SOLO nelle offerte
-    # (Esito-209).
     if _estrai_multi_lotto_testata_lotto_cig(testo, dati_pdf):
         return
 
@@ -2893,7 +2889,7 @@ def _estrai_formato_standard(testo, dati_pdf, lotto_corrente, indice_lotto):
         )
     if not nomi_lotti_trovati:
         # Lotti dichiarati SOLO in testata come "CIG Lotto 1 Lamporecchio
-        # 941376222B CIG Lotto 2 Larciano 94137708C0" (Esito-197): due o piu'
+        # 941376222B CIG Lotto 2 Larciano 94137708C0": due o piu'
         # CIG per lotto senza sezioni per-lotto nel corpo (aggiudicazione
         # condivisa). Si rilevano dai numeri di lotto della testata CIG.
         nomi_lotti_trovati = re.findall(r'CIG\s+[Ll]otto\s+([A-Z0-9]+)\b', testo)
@@ -2930,7 +2926,7 @@ def _estrai_formato_standard(testo, dati_pdf, lotto_corrente, indice_lotto):
                 _estrai_lotto_ml_std(testo, nome_lotto, altri_lotti, testo_aggiud_flat)
             )
 
-        # — AGGIUDICAZIONE CONDIVISA tra i lotti (Esito-197: "Lotto 1 e Lotto 2",
+        # — AGGIUDICAZIONE CONDIVISA tra i lotti ("Lotto 1 e Lotto 2",
         # un unico blocco offerte/aggiudicatario/ribasso/valore per entrambi).
         # I lotti rimasti scoperti ereditano il blocco unico, estratto con
         # l'helper del singolo lotto. Le offerte "N.1\nNOME Codice fiscale ..."
@@ -3017,10 +3013,10 @@ def _estrai_lotto_per_lotto(testo, nome_lotto, altri_lotti):
         testo_pulito, re.MULTILINE
     )
     if not manifestanti:
-        # (?:\d{1,4}[.)]\s*)? — le righe "1. NOME data ora" (Abetone esito-190)
+        # (?:\d{1,4}[.)]\s*)? — le righe "1. NOME data ora"
         # hanno il numero col punto: va scartato, non incluso nel nome.
         # \s* tra data e ora: tollera l'incollatura "10/11/202310:57:08"
-        # (voce LA PIASTRA, lotto 2) che altrimenti perde la riga.
+        # che altrimenti perde la riga.
         manifestanti = re.findall(
             r'^(?:\d{1,4}[.)]\s*)?([A-Za-z0-9][A-Za-z0-9 \'\.\-–&àèìòùÀÈÌÒÙ]+?)\s+\d{1,2}/\d{2}/\d{4}\s*\d{2}:\d{2}:\d{2}',
             testo_pulito, re.MULTILINE
@@ -3114,7 +3110,7 @@ def _estrai_lotto_per_lotto(testo, nome_lotto, altri_lotti):
 
     if testo_offerte_lotto:
         # prefisso "N." scartato; \s* prima di "offerta": tollera l'incollatura
-        # "F.P.E S.R.L.offerta del" (lotto 5, esito-190) che perdeva la riga.
+        # "F.P.E S.R.L.offerta del"  che perdeva la riga.
         offerte = re.findall(
             r'^(?:\d{1,4}[.)]\s*)?([A-Za-z0-9][A-Za-z0-9\s\'\.\-–&àèìòùÀÈÌÒÙ]+?)\s*[Oo]fferta\s+del',
             testo_offerte_lotto, re.MULTILINE
@@ -3122,7 +3118,7 @@ def _estrai_lotto_per_lotto(testo, nome_lotto, altri_lotti):
         if offerte:
             lotto["offerte_ricevute"] = [nome.strip() for nome in offerte]
 
-    # — Offerte CONDIVISE "LOTTO 1 e LOTTO 2" (Esito-195): un unico blocco
+    # — Offerte CONDIVISE "LOTTO 1 e LOTTO 2": un unico blocco
     # offerte vale per piu' lotti. Se il lotto non ha trovato offerte proprie
     # ma esiste un blocco intestato al suo numero INSIEME ad altri, lo eredita.
     if not lotto["offerte_ricevute"]:
@@ -3151,7 +3147,7 @@ def _estrai_lotto_per_lotto(testo, nome_lotto, altri_lotti):
 
     # — Aggiudicatario — RITAGLIATO per lotto: il blocco "LOTTO N\nNome e
     # indirizzo dell'aggiudicatario: ... Ribasso ... Valore ..." si ripete per
-    # ogni lotto (Esito-195). Si isola quello di QUESTO lotto fino al lotto
+    # ogni lotto. Si isola quello di QUESTO lotto fino al lotto
     # successivo, cosi' ribasso e valore non si mescolano tra lotti.
     _m_lotto_agg = re.search(
         rf'LOTTO\s*{nome_lotto}\b\s*\n\s*[Nn]ome\s+e\s+indirizzo\s+dell.aggiudicatario\s*:?'
@@ -3186,24 +3182,23 @@ def _estrai_lotto_per_lotto(testo, nome_lotto, altri_lotti):
                 lotto["aggiudicatario_pdf"] = match_nome.group(1).strip()
             else:
                 # indirizzo attaccato al nome senza "con sede" ne' parentesi
-                # ("INTESA SANPAOLO S.P.A. PIAZZA SAN CARLO...", Esito-195):
+                # ("INTESA SANPAOLO S.P.A. PIAZZA SAN CARLO..."):
                 # _pulisci_nome col taglio-indirizzi tronca su "PIAZZA".
                 _n = _pulisci_nome(testo_aggiud.strip(), taglia_indirizzi=True)
                 if _n:
                     lotto["aggiudicatario_pdf"] = _n
             # Ribasso e valore DAL blocco per-lotto (testo_aggiud): il greedy
-            # globale prendeva il ribasso del primo lotto per tutti (Esito-195:
-            # 13,00% sia per L1 che L2, mentre L2 e' 19,00%).
+            # globale prendeva il ribasso del primo lotto per tutti
             _mr = re.search(r'[Rr]ibasso[^\d]*([\d,\.]+)\s*%', testo_aggiud)
             if _mr:
                 lotto["ribasso"] = f"{_mr.group(1)}%"
             _mv = re.search(r"Valore\s+dell[\'\u2019]offerta[^\d\u20ac]*(?:\u20ac|Euro)\s*([\d\.,]+)", testo_aggiud)
             if _mv:
                 lotto["valore_offerta"] = f"\u20ac {_mv.group(1).rstrip(',').strip()}"
-            # P.IVA: l'embrione non la estraeva affatto. Etichette viste in
-            # esito-190: "P.I. 0160..." e "Partita IVA 0353..." (lotto 5).
+            # P.IVA: l'embrione non la estraeva affatto. Etichette viste:
+            # "P.I. 0160..." e "Partita IVA 0353..." .
             # Preferenza al C.F. quando P.IVA e C.F. sono ENTRAMBI presenti e
-            # diversi ("P.IVA -11991500015, C.F. 00799960158", Esito-195): il
+            # diversi ("P.IVA -11991500015, C.F. 00799960158"): il
             # C.F. numerico di 11 cifre e' l'identificativo fiscale primario di
             # queste societa'. Se c'e' solo la P.IVA, si usa quella.
             match_cf = re.search(r'(?:C\.?F\.?|[Cc]odice\s+fiscale)[.:\s]*(\d{11})', testo_aggiud)
@@ -3232,7 +3227,7 @@ def _estrai_formato_per_lotto(testo, dati_pdf, lotto_corrente, indice_lotto):
     Gestisce l'estrazione completa per il formato 'per_lotto'.
     Popola dati_pdf in-place.
     """
-    # "LOTTO2:" INCOLLATO (San Marcello Piteglio Esito-195) oltre a
+    # "LOTTO2:" INCOLLATO  oltre a
     # "LOTTO 1 :": il numero puo' non avere spazio prima. [A-Z]? evita che
     # "LOTTO2" catturi "2" con la O finale — qui il gruppo prende solo cifre/
     # lettere del nome lotto.
@@ -3256,8 +3251,8 @@ def _estrai_formato_per_lotto(testo, dati_pdf, lotto_corrente, indice_lotto):
             _estrai_lotto_per_lotto(testo, nome_lotto, altri_lotti)
         )
 
-    # — CIG per lotto dalla TESTATA ("Lotto 1 A023816D71: Pianosinatico...",
-    # es. sgombero neve Abetone esito-190): mappa numero->CIG riversata nei
+    # — CIG per lotto dalla TESTATA ("Lotto 1 A023816D71: Pianosinatico..."):
+    # mappa numero->CIG riversata nei
     # lotti, per l'aggancio per contenuto di seleziona_lotto_per_cig.
     for num, cig in re.findall(r'Lotto\s+([A-Z0-9]+)\s+([A-Z0-9]{10})\b', testo):
         for lotto in dati_pdf["lotti"]:
@@ -3337,7 +3332,7 @@ def _estrai_lotto_per_lotto_sub(testo, num_lotto, altri, testo_aggiud_g):
     )
     if txt_m:
         # [.)]? — il punto/parentesi dopo il numero è OPZIONALE: nel primo PDF
-        # reale di questo formato (Monsummano/Pescia, Esito-186) le righe sono
+        # reale di questo formato, le righe sono
         # "1 SICUREZZA E AMBIENTE SPA manifestazione di interesse del ...",
         # senza punto; l'embrione lo pretendeva e non estraeva nulla.
         nomi_m = re.findall(
@@ -3432,7 +3427,7 @@ def _estrai_formato_per_lotto_sub(testo, dati_pdf, lotto_corrente, indice_lotto)
         )
 
     # — CIG per lotto dichiarati in TESTATA ("CIG: Lotto 1 B1DE6AB698 / Lotto 2
-    # B1DE6AA5C5", es. Monsummano/Pescia Esito-186): la mappa numero->CIG viene
+    # B1DE6AA5C5"): la mappa numero->CIG viene
     # riversata nei lotti, cosi' seleziona_lotto_per_cig puo' agganciare per
     # contenuto anche in questo formato.
     for num, cig in re.findall(r'Lotto\s+(\d+)\s+([A-Z0-9]{10})\b', testo):
@@ -3441,8 +3436,8 @@ def _estrai_formato_per_lotto_sub(testo, dati_pdf, lotto_corrente, indice_lotto)
                 lotto["cig_lotto"] = cig
 
     # Seconda forma di testata: "- LOTTO N: TITOLO PROGETTO CIG:codice" (il CIG
-    # e' in coda alla riga del lotto, dopo il titolo, con etichetta "CIG:",
-    # es. Esito_2-2 centri estivi). Il titolo tra numero e CIG puo' essere lungo,
+    # e' in coda alla riga del lotto, dopo il titolo, con etichetta "CIG:".
+    # Il titolo tra numero e CIG puo' essere lungo,
     # quindi si aggancia il primo codice di 10 alfanum dopo "LOTTO N" fino a fine
     # riga, senza scavalcare nella riga del lotto successivo.
     for num, cig in re.findall(r'LOTTO\s+(\d+)\s*:[^\n]*?CIG[:\s]*([A-Z0-9]{10})\b', testo, re.IGNORECASE):
@@ -3450,7 +3445,7 @@ def _estrai_formato_per_lotto_sub(testo, dati_pdf, lotto_corrente, indice_lotto)
             if lotto["nome_lotto"] == f"Lotto {num}" and lotto.get("cig_lotto", "Non presente") == "Non presente":
                 lotto["cig_lotto"] = cig
 
-    # — Fallback CONDIVISI (es. Esito-186: un solo aggiudicatario per entrambi
+    # — Fallback CONDIVISI (es. un solo aggiudicatario per entrambi
     # i lotti, ribasso unico, valori spartiti per lotto). L'embrione gestiva
     # solo blocchi aggiudicatario per-lotto; se un lotto e' rimasto senza,
     # si estrae il blocco condiviso con l'helper standard e lo si copia.
@@ -3531,8 +3526,8 @@ def estrai_link_pdf_esito(url_bando, BASE_URL="https://www.provincia.pistoia.it"
 
 def _estrai_formato_multi_lotto_std(testo, dati_pdf):
     """
-    Un unico PDF con più sezioni auto-contenute "Lotto N – Titolo" (es. derrate
-    Chiesina Uzzanese, Esito-185): ogni sezione dichiara il PROPRIO CIG inline
+    Un unico PDF con più sezioni auto-contenute "Lotto N – Titolo":
+     ogni sezione dichiara il PROPRIO CIG inline
     ("CIG B2D396AD9F", senza due punti) e contiene i propri manifestanti e
     offerte in righe "(ID: NNNN) NOME manifestazione di interesse/offerta del
     data ora", le ammesse "N c.s.", l'aggiudicatario in formato standard oppure
@@ -3656,7 +3651,7 @@ def rileva_formato_pdf(testo):
     - 'per_lotto_sub': sezioni comuni con sub-header "Lotto N" dentro ogni sezione
     - 'standard':      formato unificato (singolo o multi-lotto)
     """
-    # \s* invece di \s+ per gestire "LOTTO2:" senza spazio (es. bando 33)
+    # \s* invece di \s+ per gestire "LOTTO2:" senza spazio
     if re.search(r'LOTTO\s*[A-Z0-9]+[:\s]*manifestanti\s*\d+', testo, re.IGNORECASE):
         return 'per_lotto'
     if re.search(
@@ -3667,11 +3662,9 @@ def rileva_formato_pdf(testo):
         return 'per_lotto_sub'
     # 'multi_lotto_std': un unico PDF con più sezioni auto-contenute
     # "Lotto N – Titolo", ciascuna col PROPRIO CIG inline e i propri
-    # manifestanti/offerte/aggiudicatario (es. derrate Chiesina Uzzanese,
-    # Esito-185, 8 lotti di cui 3 deserti). Richiede ALMENO 2 intestazioni
-    # numerate col trattino E almeno 2 CIG nel testo: i mono-lotto non hanno
-    # né le une né gli altri (verificato sull'intero archivio di 52 PDF, dove
-    # questo ramo scatta solo su Esito-185). Il check sta in coda apposta:
+    # manifestanti/offerte/aggiudicatario.
+    # Richiede ALMENO 2 intestazioni numerate col trattino E almeno 2 CIG nel testo: i mono-lotto non hanno
+    # né le une né gli altri. Il check sta in coda apposta:
     # non tocca i formati esistenti, aggiunge solo un'uscita nuova.
     intestazioni_ml = re.findall(r'(?im)^\s*Lotto\s+\d+\s*[–-]', testo)
     if len(intestazioni_ml) >= 2 and len(re.findall(r'\bCIG\b[.:\s]*[A-Z0-9]{10}\b', testo)) >= 2:
@@ -3710,7 +3703,7 @@ def estrai_dati_pdf_esito(url_pdf, lotto_corrente=None, indice_lotto=None):
 
         # PDF scannerizzato (solo immagini, nessun layer di testo): pdfplumber non può
         # estrarre nulla e tutti i campi resterebbero vuoti in silenzio. Lo segnala
-        # esplicitamente e si ferma (es. bando impianti sportivi Ponte Buggianese 2017).
+        # esplicitamente e si ferma
         if len(testo.strip()) < 50 and n_immagini > 0:
             log(f"    [!] PDF scannerizzato (immagine, nessun testo estraibile): {url_pdf}")
             log(f"        -> dati non estraibili senza OCR; campi lasciati a 'Non presente'")
@@ -3725,23 +3718,18 @@ def estrai_dati_pdf_esito(url_pdf, lotto_corrente=None, indice_lotto=None):
 
         # — CIG dichiarato nel PDF —
         # Serve a main.py per agganciare CIG→PDF per CONTENUTO (bandi multi-lotto
-        # con un PDF per lotto, es. SP17/SP24 Esito-183/184) invece che per
+        # con un PDF per lotto) invece che per
         # posizione. Pattern: "CIG: B2E0277731" ma anche "SmartCIG ZEECDCAC17"
-        # (prefisso Smart, es. Esito-156); il \b dopo CIG evita falsi positivi
-        # su parole che iniziano per CIG (es. il manifestante "CIGLIANI ALESSIO",
-        # bando esito-142). Scansione empirica sui 52 PDF in archivio: 40 dichiarano
-        # esattamente un CIG, nessuno più d'uno, 12 nessuno (resta "Non presente").
+        # (prefisso Smart); il \b dopo CIG evita falsi positivi
+        # su parole che iniziano per CIG (es. il manifestante "CIGLIANI ALESSIO").
         m_cig = re.search(r'\b(?:Smart\s*)?CIG\b[.:\s]*([A-Z0-9]{10})\b', testo)
         if m_cig:
             dati_pdf["cig_pdf"] = m_cig.group(1)
         else:
-            # — CIG etichettato per refuso come "CPV" (es. Montale 2019,
-            # Esito_signed-6: "CPV 7898785B93") — un CPV vero e' cifre+trattino
+            # — CIG etichettato per refuso come "CPV"  — un CPV vero e' cifre+trattino
             # (45233141-9): un token di 10 alfanumerici CON almeno una lettera
             # dopo l'etichetta CPV non puo' essere un CPV ed e' il CIG della
-            # gara. Verificato sull'intero archivio (60 PDF): il caso esiste
-            # solo li'. Il valore resta quello del PDF, cambia solo l'etichetta
-            # sotto cui lo si e' trovato.
+            # gara.
             m_cig = re.search(r'\bCPV\b[:\s]*([A-Z0-9]{10})\b', testo)
             if m_cig and re.search(r'[A-Z]', m_cig.group(1)):
                 dati_pdf["cig_pdf"] = m_cig.group(1)
@@ -3757,13 +3745,13 @@ def estrai_dati_pdf_esito(url_pdf, lotto_corrente=None, indice_lotto=None):
 
         # — INVITATI CONDIVISI PROPAGATI AI LOTTI — Regola trasversale ai
         # formati: se il documento ha piu' lotti e la lista degli invitati e'
-        # dichiarata a livello documento (es. Ciclovia del Sole esito-187, dove
+        # dichiarata a livello documento (es. dove
         # il PDF non dice chi fu invitato a quale lotto), ogni lotto senza
         # invitati propri la eredita per intero: gli invitati della gara si
         # considerano invitati di ciascun lotto. I mono-lotto (1 solo lotto)
         # non vengono toccati: leggono gia' il livello documento.
         # ECCEZIONE: quando i manifestanti sono dichiarati PER LOTTO (es.
-        # Esito_F-2/F-3: "manifestazioni interesse ricevute Lotto n.1: 1" e
+        #  "manifestazioni interesse ricevute Lotto n.1: 1" e
         # "Lotto n.2: 3"), la lista a livello documento non e' una lista
         # autonoma ma la semplice FUSIONE delle liste dei lotti (1+3=4 nomi,
         # con "ASD Ponte 2000" ripetuto perche' presente in entrambi). Se in
@@ -3791,8 +3779,7 @@ def estrai_dati_pdf_esito(url_pdf, lotto_corrente=None, indice_lotto=None):
                     _lotto["invitati"] = list(dati_pdf["operatori_invitati"])
 
         # — INVITATI = MANIFESTANTI quando i conteggi coincidono — Se un lotto
-        # dichiara il NUMERO di invitati ma non i nomi (es. sgombero neve
-        # Abetone esito-190: "LOTTO 1: invitati 2") e quel numero e' UGUALE ai
+        # dichiara il NUMERO di invitati ma non i nomi (es.  "LOTTO 1: invitati 2") e quel numero e' UGUALE ai
         # manifestanti elencati del lotto, gli invitati sono per forza loro:
         # la lista si riempie con la copia dei manifestanti. Se il conteggio
         # e' diverso (invitati un sottoinsieme) NON si copia nulla: il PDF
@@ -3807,7 +3794,7 @@ def estrai_dati_pdf_esito(url_pdf, lotto_corrente=None, indice_lotto=None):
 
         # — "COME SOPRA" CON MANIFESTANTI PER LOTTO — Quando gli invitati sono
         # dichiarati solo con la formula "Come sopra" e i manifestanti sono
-        # elencati per lotto (Esito_F-2/F-3), il rimando va sciolto DENTRO
+        # elencati per lotto, il rimando va sciolto DENTRO
         # ciascun lotto: gli invitati del Lotto N sono i manifestanti del
         # Lotto N (1 per il Lotto 1, 3 per il Lotto 2), non la fusione delle
         # due liste. Il totale dichiarato a livello documento (qui 3) resta
@@ -3822,12 +3809,12 @@ def estrai_dati_pdf_esito(url_pdf, lotto_corrente=None, indice_lotto=None):
         # — C.F. DELL'AGGIUDICATARIO — Ricavato una volta sola qui, invece che
         # nei dieci punti che assegnano la P.IVA. Si cerca nel testo la riga che
         # porta la P.IVA gia' estratta e da quella si legge il codice fiscale,
-        # quando il PDF lo dichiara a parte (Esito-212: "P.IVA -11991500015,
+        # quando il PDF lo dichiara a parte ( "P.IVA -11991500015,
         # C.F. 00799960158"). Con l'etichetta unica "CF/P.IVA" il codice e' uno
         # solo e vale per entrambi i campi.
         # La riga va cercata DENTRO la sezione dell'aggiudicatario, non in
         # tutto il documento: la stessa P.IVA compare spesso anche nell'elenco
-        # degli invitati, che viene PRIMA (Esito-214: "37. MI.CO.SRL P.IVA:
+        # degli invitati, che viene PRIMA ( "37. MI.CO.SRL P.IVA:
         # 01418060859" a riga 140, l'aggiudicatario a riga 207). Prendendo la
         # prima occorrenza si leggeva la riga dell'invitato, priva del C.F., e
         # il campo finiva per ripiegare sulla P.IVA — perdendo il codice
@@ -3902,8 +3889,7 @@ def cig_compatibile(dichiarato, cercato):
     """
     True se il CIG dichiarato (nel PDF o nel lotto) corrisponde a quello
     cercato. Oltre all'uguaglianza esatta, accetta il caso del CIG di pagina
-    TRONCATO (refuso di pagina, 8-9 caratteri invece di 10, es. bando
-    Monsummano/Pescia): un codice monco combacia se e' PREFISSO del CIG pieno.
+    TRONCATO (refuso di pagina, 8-9 caratteri invece di 10): un codice monco combacia se e' PREFISSO del CIG pieno.
     Il troncamento conserva il prefisso; se il refuso fosse un carattere
     mancante in mezzo, il prefisso non combacia e resta il fallback posizionale.
 
@@ -3918,7 +3904,7 @@ def cig_compatibile(dichiarato, cercato):
         return True
     # Prefisso SIMMETRICO: copre sia il CIG di pagina TRONCATO (8-9 char,
     # prefisso del CIG pieno del PDF) sia il CIG del PDF con un carattere IN
-    # PIU' per refuso (11 char, es. "A01EF539010" esito-194, di cui il CIG
+    # PIU' per refuso (11 char, es. "A01EF539010", di cui il CIG
     # vero di pagina e' prefisso). Il minimo di 8 caratteri comuni esclude
     # collisioni accidentali tra CIG di lotti diversi.
     if min(len(d), len(c)) < 8:
@@ -3934,7 +3920,7 @@ def cig_compatibile(dichiarato, cercato):
             if lungo[:i] + lungo[i+1:] == corto:
                 return True
     # Refuso di UN carattere SOSTITUITO, stessa lunghezza (es. PDF
-    # "9194938EDD" vs pagina "9194938EED", Esito_2-2: D/E scambiate in
+    # "9194938EDD" vs pagina "9194938EED": D/E scambiate in
     # penultima posizione). Completa la distanza di edit <= 1 insieme ai due
     # casi sopra (inserzione/cancellazione). Verificato sull'archivio: fra gli
     # 88 CIG reali non esiste NESSUNA coppia di codici legittimamente diversi
@@ -3942,7 +3928,7 @@ def cig_compatibile(dichiarato, cercato):
     if len(d) == len(c) and sum(1 for x, y in zip(d, c) if x != y) == 1:
         return True
     # Refuso di DUE caratteri ADIACENTI SCAMBIATI, stessa lunghezza (es. pagina
-    # "9376278D5E" vs PDF "9376278DE5", Massa e Cozzile: la coppia "5E" e'
+    # "9376278D5E" vs PDF "9376278DE5": la coppia "5E" e'
     # digitata "E5"). E' l'errore di battitura piu' comune dopo la sostituzione,
     # ma in distanza di edit vale 2, quindi i rami sopra non lo coprono.
     # Si accetta SOLO la trasposizione vera e propria: le due posizioni devono
@@ -3962,7 +3948,7 @@ def cig_compatibile(dichiarato, cercato):
 def seleziona_pdf_per_cig(lista_pdf, idx, cig_singolo, cache=None, estrai=None):
     """
     Sceglie i dati del PDF giusto per il CIG corrente quando il bando ha
-    PIU' PDF (tipicamente un PDF per lotto, es. gara SP17/SP24 Esito-183/184).
+    PIU' PDF (tipicamente un PDF per lotto).
 
     Vive qui (e non nell'orchestratore) perche' e' logica di dominio
     riusabile da QUALUNQUE frontend: main.py a riga di comando oggi,
@@ -3972,8 +3958,7 @@ def seleziona_pdf_per_cig(lista_pdf, idx, cig_singolo, cache=None, estrai=None):
       1. Aggancio per CONTENUTO: si estrae ogni PDF (con cache, per non
          scaricare/estrarre due volte) e si cerca quello che dichiara in
          testata il CIG corrente (campo "cig_pdf").
-      2. Fallback POSIZIONALE: se nessun PDF dichiara quel CIG (12 PDF su 52
-         dell'archivio non riportano il CIG in testata), si assume ordine di
+      2. Fallback POSIZIONALE: se nessun PDF dichiara quel CIG, si assume ordine di
          pagina = ordine dei PDF e si prende lista_pdf[idx], come prima.
 
     Parametri:
@@ -3990,6 +3975,7 @@ def seleziona_pdf_per_cig(lista_pdf, idx, cig_singolo, cache=None, estrai=None):
         cache = {}
 
     def _cached(url):
+        """Estrae i dati di un PDF una volta sola, riusando la cache."""
         if url not in cache:
             cache[url] = estrai(url, indice_lotto=None)
         return cache[url]
@@ -4006,8 +3992,8 @@ def seleziona_pdf_per_cig(lista_pdf, idx, cig_singolo, cache=None, estrai=None):
 def seleziona_lotto_per_cig(dati_pdf, cig_singolo, indice_lotto=None):
     """
     Sceglie il LOTTO giusto per il CIG corrente quando un unico PDF contiene
-    più lotti, ognuno col proprio CIG (formato 'multi_lotto_std', es. derrate
-    Chiesina Uzzanese Esito-185). Gemella di seleziona_pdf_per_cig, che invece
+    più lotti, ognuno col proprio CIG (formato 'multi_lotto_std').
+    Gemella di seleziona_pdf_per_cig, che invece
     sceglie tra più PDF: qui si sceglie tra i lotti di uno stesso documento.
 
     Strategia:
@@ -4067,6 +4053,7 @@ def costruisci_lista_cig(cig_list_pagina, lista_pdf, cache=None, estrai=None,
         cache = {}
 
     def _cached(url):
+        """Estrae i dati di un PDF una volta sola, riusando la cache."""
         if url not in cache:
             cache[url] = estrai(url, indice_lotto=None)
         return cache[url]
@@ -4092,8 +4079,7 @@ def costruisci_lista_cig(cig_list_pagina, lista_pdf, cache=None, estrai=None,
             # Quale dei due codici finisce in lista? LA PAGINA E' IL RIFERIMENTO
             # CORRETTO: se il CIG di pagina e' gia' completo (10 caratteri) si
             # tiene QUELLO, anche quando il PDF ne dichiara uno diverso per
-            # refuso (es. Esito_2-2: PDF "9194938EDD" vs pagina "9194938EED",
-            # una lettera sbagliata) — mandare ad ANAC il codice del PDF
+            # refuso — mandare ad ANAC il codice del PDF
             # significherebbe interrogare un CIG inesistente.
             # Il codice del PDF si usa solo per PROMUOVERE un CIG di pagina
             # TRONCATO (8-9 caratteri), dove il PDF aggiunge informazione.
@@ -4110,17 +4096,14 @@ def costruisci_lista_cig(cig_list_pagina, lista_pdf, cache=None, estrai=None,
     # pagina non copre. Quando c'e' UN SOLO PDF, con UN SOLO LOTTO e senza CIG
     # per-lotto, il documento descrive una gara sola: se il suo CIG di testata
     # e' diverso da quello di pagina non e' un lotto in piu', e' una
-    # DIVERGENZA fra le due fonti (es. esito_gara-7, Via Romea Nonantolana:
+    # DIVERGENZA fra le due fonti (es.  Via Romea Nonantolana:
     # pagina 9124822951, PDF 904115879A, codici del tutto diversi — non un
     # refuso, cig_compatibile li respinge). Integrarlo faceva iterare due
     # volte sulla stessa identica gara, stampandola due volte.
     # LA PAGINA E' IL RIFERIMENTO: e' la fonte primaria ed e' il codice valido
     # per ANAC, quindi il CIG del PDF si scarta e resta segnalato al chiamante
     # tra i "divergenti", perche' l'incoerenza non vada perduta.
-    # La guardia NON tocca i casi in cui l'integrazione e' indispensabile:
-    # PDF multi-lotto con CIG per lotto (19 in archivio, es. Esito-185 con 8
-    # lotti) e gare con PIU' PDF, uno per lotto (SP17/SP24 Esito-183/184, dove
-    # il CIG del secondo PDF e' l'unico modo di processare il Lotto B).
+    # La guardia NON tocca i casi in cui l'integrazione e' indispensabile
     divergenti = []
     _un_solo_pdf_mono_lotto = (
         len(lista_pdf or []) == 1

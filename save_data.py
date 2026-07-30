@@ -1,3 +1,29 @@
+"""
+Generazione del file Excel con i risultati della ricerca.
+
+Ultimo anello della catena: riceve i bandi gia' raccolti e arricchiti dalle
+altre parti del programma e li trasforma in una tabella formattata.
+
+La forma della tabella
+    Una riga per OPERATORE INVITATO, per ogni lotto — non una riga per bando.
+    Un bando multi-lotto con dieci invitati occupa quindi molte righe, in cui
+    i dati della gara si ripetono. E' una scelta voluta: cosi' si puo'
+    filtrare per operatore e contare le sue ricorrenze, cosa impossibile se
+    tutti gli invitati stessero ammassati in una cella sola.
+
+    Le venti colonne uniscono le tre fonti: sito della Provincia, PDF di
+    esito e API ANAC. I lotti sono distinti da colori diversi, per rendere
+    leggibile a colpo d'occhio dove finisce uno e comincia l'altro.
+
+Il filtro per operatore
+    Se salva_in_excel riceve una P.IVA, la tabella si restringe ai soli bandi
+    in cui quel soggetto compare fra gli invitati. Il riconoscimento avviene
+    solo sul codice dichiarato nel documento, mai sulla ragione sociale.
+
+Se non viene indicato un nome, il file si chiama bandi_pistoia_ seguito da
+data e ora.
+"""
+
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from datetime import datetime
@@ -7,8 +33,7 @@ from console import log  # stampa solo se console.VERBOSE e' acceso
 
 # =====================================================================
 # COLORI DEI LOTTI
-# Un bando multi-lotto occupa molte righe consecutive (esito-191 ne genera
-# 96, Esito-205 ne ha 54 divise in 9 lotti): senza un segno visivo i blocchi
+# Un bando multi-lotto occupa molte righe consecutive : senza un segno visivo i blocchi
 # si fondono, e bandi multi-lotto CONSECUTIVI diventano indistinguibili.
 #
 # Lo schema e' a due livelli:
@@ -72,9 +97,6 @@ def _codici_aggiudicatario(dati_anac, lotto):
             codici.add(n)
     if codici:
         return codici
-    # Ripiego sul PDF: nell'archivio 215 aggiudicatari su 226 hanno la P.IVA
-    # dichiarata nel documento, quindi il confronto resta possibile quasi
-    # sempre anche senza ANAC.
     for campo in ("aggiudicatario_piva", "aggiudicatario_cf"):
         for c in str((lotto or {}).get(campo, "")).split(","):
             n = _norm_codice(c)
@@ -261,8 +283,7 @@ def _righe_da_bando(bando, piva_cercata=None):
                 # presente e sempre identico per tutti i lotti di una gara.
                 # Il NUMERO_GARA di ANAC sembrerebbe piu' appropriato, ma non e'
                 # affidabile: di solito i lotti lo condividono, pero' capita che
-                # ANAC ne assegni uno DIVERSO a ciascuno (Chiesina Uzzanese, 8
-                # lotti registrati come 8 procedure separate), e in quel caso il
+                # ANAC ne assegni uno DIVERSO a ciascuno, e in quel caso il
                 # bando si spezzerebbe in 8 famiglie di colore. Resta come
                 # ripiego per l'eventualita' che l'URL manchi.
                 "chiave_bando": (dati_pagina.get("url_provincia", "")

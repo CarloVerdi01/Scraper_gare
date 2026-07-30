@@ -1,3 +1,32 @@
+"""
+Interfaccia grafica desktop dello scraper dei bandi (PyQt6).
+
+Apre una finestra in cui impostare i filtri, avviare la ricerca e seguirne
+l'avanzamento. Non contiene logica di scraping: quella sta nei moduli
+condivisi, che questo file coordina tramite avvia_ricerca_bandi, funzione
+identica a quella di web/app.py.
+
+Come resta reattiva durante la ricerca
+    Una scansione dura tanto: eseguirla nel thread della finestra la
+    congelerebbe. Gira percio' in un thread separato, che pero' non puo'
+    toccare i widget — in ogni libreria grafica solo il thread principale
+    puo' farlo. I due mondi comunicano quindi per messaggi:
+
+        thread di sfondo  ->  queue.Queue  ->  QTimer  ->  finestra
+
+    Il thread deposita nella coda messaggi come "sono al bando 7 di 30"; un
+    timer la svuota dieci volte al secondo (_controlla_coda) e traduce ogni
+    messaggio in un aggiornamento visibile. L'interruzione viaggia in senso
+    opposto, tramite un threading.Event che il motore consulta all'inizio di
+    ogni bando, cosi' lo stop avviene sempre a un punto pulito.
+
+Avvio
+    python gui.py
+
+Non stampa nulla in console: i messaggi diagnostici dei moduli condivisi
+restano spenti (vedi console.py) perche' qui l'utente ha la finestra.
+"""
+
 import sys
 import os
 import threading
@@ -13,7 +42,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QColor
-# Import completi per l'orchestrazione condivisa con la web app.
+# Import completi per la ricerca condivisa con la web app.
 from scraper import (genera_url_con_filtri, estrai_lista_bandi, BASE_URL,
                      estrai_dati_json_anac, scarica_json_anac, estrai_dettagli_bando,
                      reimposta_via_anac)
@@ -213,6 +242,51 @@ STILE_APPLICAZIONE = """
 # ============================================================
 
 def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="qualsiasi", contraente="qualsiasi", data_limite=None, data_fine=None, piva_invitato=None, nome_file=None, deve_fermarsi=None, segnala_progresso=None):
+    """
+    Esegue una ricerca completa e ne salva il risultato in un file Excel.
+
+    E' il cuore del programma: coordina i tre moduli di logica, che da soli non
+    si conoscono fra loro. Per ogni bando trovato:
+
+      1. costruisce l'URL di ricerca con i filtri e ne ricava l'elenco dei
+         bandi (scraper.py);
+      2. ne legge la pagina di dettaglio: tipologia, enti, date, CIG;
+      3. scarica i PDF di esito e li interpreta, ricavando invitati, lotti e
+         gli eventuali CIG assenti dalla pagina (scraper_pdf.py);
+      4. interroga l'API ANAC per ciascun CIG: oggetto, CUP, CPV,
+         aggiudicatario (scraper.py);
+      5. accumula tutto e, alla fine, genera l'Excel (save_data.py).
+
+    Questa funzione e' identica a quella di web/app.py: le due interfacce
+    condividono lo stesso motore, e ogni correzione va riportata su entrambe.
+
+    Parametri dei filtri (tutti facoltativi: se omessi non restringono nulla)
+        parola_chiave   testo cercato nell'oggetto del bando
+        cig             CIG cercato, anche parziale
+        stato,          voci dei menu, tradotte nei codici del sito
+        tipologia,      tramite le mappe MAPPA_* di questo file
+        contraente
+        data_limite     data di pubblicazione minima, formato ISO (aaaa-mm-gg)
+        data_fine       data di pubblicazione massima, stesso formato
+        piva_invitato   P.IVA o codice fiscale: tiene solo i bandi in cui quel
+                        soggetto compare fra gli invitati dichiarati nei PDF
+
+    Altri parametri
+        nome_file       percorso del file Excel da creare
+        deve_fermarsi   funzione senza argomenti che restituisce True quando
+                        l'utente ha chiesto di interrompere. Viene interrogata
+                        all'inizio di ogni bando, mai a meta' di un'operazione
+        segnala_progresso  funzione (fatti, totale) chiamata a ogni bando
+                        completato, per aggiornare la barra di avanzamento
+
+    Restituisce
+        Un dizionario con la chiave "anac_giu": True se ANAC e' stato
+        interrogato ma non ha risposto per NESSUN CIG, cioe' se il servizio era
+        verosimilmente guasto. Serve ad avvisare che le colonne ANAC sono vuote
+        per un guasto, non perche' quelle gare non fossero pubblicate.
+        Restituisce None se l'utente ha interrotto la ricerca: in quel caso non
+        viene prodotto alcun file.
+    """
     codice_stato = MAPPA_STATO[stato]
     codice_tipologia = MAPPA_TIPOLOGIA[tipologia]
     codice_contraente = MAPPA_CONTRAENTE[contraente]
@@ -455,7 +529,7 @@ def anac_raggiungibile(tentativi=3, pausa=2):
     ma quando ANAC risponde subito il controllo finisce in un colpo. Solo se
     TUTTI i tentativi falliscono il servizio e' considerato giu'.
     """
-    CIG_TEST = "A040010618"  # CIG reale e stabile (Chiesina Uzzanese, gia' verificato)
+    CIG_TEST = "A040010618"  # CIG reale e stabile (gia' verificato)
     for n in range(1, tentativi + 1):
         try:
             reimposta_via_anac()
@@ -470,6 +544,19 @@ def anac_raggiungibile(tentativi=3, pausa=2):
 
 class BandiPistoiaApp(QMainWindow):
     def __init__(self):
+        """
+        Costruisce la finestra e tutto il suo contenuto.
+
+        Oltre ai widget prepara i tre strumenti che permettono alla ricerca di
+        girare senza congelare l'interfaccia: un Event usato come bandiera di
+        interruzione, una Queue su cui il thread di sfondo deposita i messaggi,
+        e un QTimer che ogni decimo di secondo la svuota. E' la regola di ogni
+        interfaccia grafica: solo il thread principale puo' toccare i widget,
+        quindi il lavoro lungo sta altrove e comunica per messaggi.
+
+        Le sezioni della finestra sono costruite dai metodi _crea_*, chiamati
+        in fondo nell'ordine in cui compaiono a schermo.
+        """
         super().__init__()  # Chiama l'inizializzazione della classe genitore (QMainWindow)
 
         self.setWindowTitle(
@@ -564,13 +651,22 @@ class BandiPistoiaApp(QMainWindow):
 
         self.setFocus()  # Assicura che all'avvio nessun campo di testo sia selezionato di default
 
-    def _aggiungi_separatore(self):  # Funzione per creare linee orizzontali per separare i blocchi
+    def _aggiungi_separatore(self):
+        """Inserisce una linea orizzontale per separare due blocchi di filtri."""
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         self._layout.addWidget(sep)
 
-    def _crea_intestazione(
-            self):  # Header istituzionale, coerente con la web app: barra scura + fascia blu con stemma e titoli
+    def _crea_intestazione(self):
+        """
+        Costruisce l'intestazione istituzionale: barra scura con il nome
+        dell'ente e fascia blu con stemma e titoli.
+
+        E' l'unica parte che sta fuori dall'area scorrevole, cosi' le bande
+        restano a tutta larghezza e ferme mentre il resto scorre. Riprende
+        l'aspetto della web app perche' le due interfacce sembrino lo stesso
+        programma.
+        """
         # Barra ente (sottile, blu scuro) in cima, a tutta larghezza.
         barra_ente = QLabel("Regione Toscana - Provincia di Pistoia")
         barra_ente.setStyleSheet(
@@ -619,7 +715,15 @@ class BandiPistoiaApp(QMainWindow):
         self._header_layout.addWidget(barra_ente)
         self._header_layout.addWidget(fascia)
 
-    def _crea_filtri(self):  # Costruisce la sezione centrale contenente i campi di testo e i menu a tendina
+    def _crea_filtri(self):
+        """
+        Costruisce la sezione dei filtri principali: parola chiave, CIG e i tre
+        menu a tendina (stato, tipologia, scelta del contraente).
+
+        Le voci dei menu arrivano dalle mappe MAPPA_* definite in cima al file,
+        non sono scritte qui: aggiungere una tipologia significa modificare un
+        solo punto del progetto.
+        """
 
         # creiamo una "scatola" contenitore con layout verticale
         frame = QWidget()
@@ -703,7 +807,16 @@ class BandiPistoiaApp(QMainWindow):
         # Aggiunge l'intero blocco "Filtri" al layout della finestra principale
         self._layout.addWidget(frame)
 
-    def _crea_sezione_data(self):  # Costruisce la sezione per filtrare i bandi in base alla data di pubblicazione
+    def _crea_sezione_data(self):
+        """
+        Costruisce il filtro sull'intervallo di pubblicazione: una casella di
+        attivazione e sei menu (giorno, mese, anno per la data di inizio e per
+        quella di fine).
+
+        I menu invece di un campo libero impediscono in partenza le date
+        scritte male; restano da verificare solo quelle inesistenti, come il
+        31 febbraio, di cui si occupa _valida_data.
+        """
         # Creiamo il contenitore principale per la sezione data
         frame = QWidget()
         layout = QVBoxLayout(frame)
@@ -808,7 +921,15 @@ class BandiPistoiaApp(QMainWindow):
 
         self._layout.addWidget(frame)
 
-    def _crea_sezione_operatore(self):  # Sezione per filtrare i bandi in cui e' stato invitato un operatore
+    def _crea_sezione_operatore(self):
+        """
+        Costruisce il filtro per operatore: casella di attivazione e campo per
+        la P.IVA o il codice fiscale.
+
+        Si chiede il codice e non la ragione sociale perche' l'identificazione
+        avviene solo su quello: esistono imprese diverse con lo stesso nome, e
+        i PDF non sempre associano nome e codice in modo affidabile.
+        """
         frame = QWidget()
         layout = QVBoxLayout(frame)
         layout.setSpacing(8)
@@ -851,7 +972,11 @@ class BandiPistoiaApp(QMainWindow):
 
         self._layout.addWidget(frame)
 
-    def _toggle_piva(self):  # Attiva o spegne il campo P.IVA
+    def _toggle_piva(self):
+        """
+        Attiva o disattiva il campo P.IVA seguendo la sua casella di spunta,
+        cambiandone il bordo perche' si veda a colpo d'occhio se e' in uso.
+        """
         attivo = self.checkbox_piva.isChecked()
         self.campo_piva.setEnabled(attivo)
         if attivo:
@@ -863,7 +988,16 @@ class BandiPistoiaApp(QMainWindow):
             self.label_errore_piva.setText("")
         self._valida_piva()
 
-    def _valida_piva(self):  # Verifica lunghezza P.IVA (11) o C.F. (16)
+    def _valida_piva(self):
+        """
+        Controlla che il codice inserito sia lungo 11 cifre (P.IVA) o 16
+        caratteri (codice fiscale), e restituisce True se va bene.
+
+        Prima del controllo toglie spazi, punti, trattini e l'eventuale
+        prefisso "IT", cosi' chi incolla "IT 01824600470" non viene respinto
+        per un motivo di sola forma. Il messaggio di errore compare sotto il
+        campo; un campo vuoto e' valido, perche' il filtro e' facoltativo.
+        """
         if not self.checkbox_piva.isChecked():
             self.label_errore_piva.setText("")
             return True
@@ -880,7 +1014,11 @@ class BandiPistoiaApp(QMainWindow):
         self.label_errore_piva.setText("La P.IVA deve avere 11 cifre, il C.F. 16 caratteri.")
         return False
 
-    def _toggle_data(self):  # Attiva o spegne i menu delle date e cambia il loro stile visivo in base alla Checkbox
+    def _toggle_data(self):
+        """
+        Attiva o disattiva i sei menu delle date seguendo la loro casella di
+        spunta, e rivalida subito l'intervallo.
+        """
         # Controlla se la casella è spuntata (True) o no (False)
         attivo = self.checkbox_data.isChecked()
 
@@ -900,7 +1038,15 @@ class BandiPistoiaApp(QMainWindow):
         # controlliamo se la data inserita (anche se appena riattivata) è valida
         self._valida_data()
 
-    def _valida_data(self):  # Verifica che la data selezionata dall'utente esista davvero
+    def _valida_data(self):
+        """
+        Verifica che le due date esistano davvero e siano in ordine, e
+        restituisce True se l'intervallo e' utilizzabile.
+
+        Delega a _componi_data il lavoro sulle singole date (combinazioni
+        ammesse e completamento dei pezzi mancanti) e qui aggiunge il controllo
+        che la fine non preceda l'inizio. Gli errori compaiono sotto i menu.
+        """
 
         # Se la spunta non è attiva, non c'è bisogno di validare nulla. Cancelliamo eventuali errori.
         if not self.checkbox_data.isChecked():
@@ -972,8 +1118,15 @@ class BandiPistoiaApp(QMainWindow):
             return "", "data non valida (controlla il giorno)."
         return f"{anno:04d}-{mese:02d}-{giorno:02d}", ""
 
-    def _crea_sezione_salvataggio(
-            self):  # Costruisce i campi relativi alla scelta del nome file e a dove salvare il file Excel di output
+    def _crea_sezione_salvataggio(self):
+        """
+        Costruisce la sezione del salvataggio: nome del file Excel e scelta
+        della cartella di destinazione.
+
+        Entrambi facoltativi. Senza nome se ne genera uno con data e ora;
+        senza cartella si usa quella predefinita (Download), indicata
+        dall'etichetta accanto al pulsante Sfoglia.
+        """
         # Scatola contenitore con layout verticale per questa sezione
         frame = QWidget()
         layout = QVBoxLayout(frame)
@@ -1045,7 +1198,13 @@ class BandiPistoiaApp(QMainWindow):
 
         self._layout.addWidget(frame)
 
-    def _scegli_cartella(self):  # Apre la finestra per selezionare interattivamente la cartella di destinazione
+    def _scegli_cartella(self):
+        """
+        Apre la finestra di sistema per scegliere la cartella di destinazione.
+
+        Il percorso scelto viene memorizzato in _cartella_scelta, che e' il
+        dato usato al salvataggio: l'etichetta serve solo a mostrarlo.
+        """
         cartella = QFileDialog.getExistingDirectory(self,
                                                     "Scegli cartella di destinazione")  # apre la finestra standard per scegliere una cartella, restituisce una stringa con il percorso
         # Se è stata scelta una cartella (la stringa non è vuota)
@@ -1054,7 +1213,15 @@ class BandiPistoiaApp(QMainWindow):
             self.label_cartella.setText(cartella)  # Aggiorna il testo dell'etichetta mostrando il percorso reale
             self.label_cartella.setStyleSheet("color: #2c3e50; font-style: normal; font-weight: 500;")
 
-    def _valida_nome_file(self):  # Verifica l'uso di caratteri vietati nel nome del file
+    def _valida_nome_file(self):
+        """
+        Controlla che il nome del file non contenga caratteri vietati dai
+        sistemi operativi, e restituisce True se e' utilizzabile.
+
+        Sono i nove caratteri proibiti da Windows, il piu' restrittivo dei tre
+        sistemi: accettarli qui significherebbe produrre un file che non si
+        puo' salvare, con un errore poco chiaro a fine ricerca.
+        """
         nome = self.campo_nome_file.text().strip()  # Prende il testo digitato
         caratteri_vietati = {'/', '\\', ':', '*', '?', '"', '<', '>', '|'}  # Set di caratteri vietati
         trovati = [c for c in nome if c in caratteri_vietati]  # lista contenente solo i caratteri vietati inseriti
@@ -1065,7 +1232,8 @@ class BandiPistoiaApp(QMainWindow):
         self.label_errore_nome.setText("")  # se non ci sono caratteri vietati cancella il testo e dà il via libera
         return True
 
-    def _crea_pulsanti(self):  # Costruisce i due pulsanti (Reset e Avvia) in fondo
+    def _crea_pulsanti(self):
+        """Costruisce i due pulsanti in fondo alla finestra: Reset e Avvia."""
         frame = QWidget()
         layout = QHBoxLayout(frame)
         layout.setSpacing(15)
@@ -1118,7 +1286,14 @@ class BandiPistoiaApp(QMainWindow):
         # Aggiunge il layout alla finestra
         self._layout.addWidget(frame)
 
-    def _reset_filtri(self):  # Ripristina tutti i campi dell'interfaccia allo stato iniziale
+    def _reset_filtri(self):
+        """
+        Riporta tutti i campi allo stato iniziale.
+
+        Non fa nulla se una ricerca e' in corso: i filtri in quel momento sono
+        congelati, e svuotarli darebbe l'impressione sbagliata di aver
+        cambiato una ricerca gia' avviata.
+        """
         # Se c'è una ricerca in corso blocca il reset
         if self._ricerca_in_corso:
             return
@@ -1143,8 +1318,15 @@ class BandiPistoiaApp(QMainWindow):
         self.etichetta_finale.setText("")
         self.etichetta_finale.hide()
 
-    def _gestisci_pulsante(
-            self):  # Metodo di controllo, gestisce se avviare la ricerca o interromperla in base allo stato attuale
+    def _gestisci_pulsante(self):
+        """
+        Risponde al pulsante principale, che cambia funzione secondo lo stato:
+        avvia la ricerca se e' ferma, ne chiede l'interruzione se e' in corso.
+
+        Prima di avviare esegue tutte le validazioni (date, P.IVA, nome del
+        file) e prepara il percorso di destinazione, generando il nome con
+        data e ora se l'utente non l'ha indicato.
+        """
 
         # Se la ricerca è già attiva allora il click è avvenuto su interrompi
         if self._ricerca_in_corso:
@@ -1182,7 +1364,13 @@ class BandiPistoiaApp(QMainWindow):
         # Lancia la funzione che avvia lo scraping, passando il percorso in cui salvare
         self._avvia_ricerca(percorso)
 
-    def _crea_barra_avanzamento(self):  # Costruisce la barra di progresso e stato in fondo alla pagina
+    def _crea_barra_avanzamento(self):
+        """
+        Costruisce gli elementi che raccontano l'andamento della ricerca:
+        l'etichetta di stato, la barra di avanzamento e il messaggio finale.
+
+        Barra e messaggio nascono nascosti e compaiono solo quando servono.
+        """
 
         # Etichetta di stato, serve per mostrare messaggi tipo "Connessione al portale..." o "Elaborazione bando 5 di 10"
         self.etichetta_stato = QLabel("")
@@ -1228,8 +1416,17 @@ class BandiPistoiaApp(QMainWindow):
             self._toggle_data()  # riallinea i menu data allo stato della casella
             self._toggle_piva()  # riallinea il campo P.IVA allo stato della casella
 
-    def _avvia_ricerca(self,
-                       percorso_file):  # Prepara l'interfaccia per il caricamento e lancia il thread separato per lo scraping
+    def _avvia_ricerca(self, percorso_file):
+        """
+        Prepara la finestra per la ricerca e lancia il thread che la esegue.
+
+        Congela i filtri, trasforma il pulsante Avvia in Interrompi, mostra la
+        barra, raccoglie i valori dei campi e fa partire _esegui_ricerca in
+        sottofondo insieme al timer che sorveglia la coda dei messaggi.
+
+        Il thread e' daemon: se si chiude la finestra mentre lavora, muore con
+        essa invece di tenere vivo il programma.
+        """
         self._interrompi.clear()  # Pulisce l'evento di interruzione (nel caso fosse rimasto "alzato" da una ricerca precedente)
         self._ricerca_in_corso = True  # Segnala che c'è una ricerca attiva
         self.etichetta_finale.hide()  # Nasconde eventuali messaggi di fine operazione precedenti
@@ -1290,7 +1487,17 @@ class BandiPistoiaApp(QMainWindow):
         # Fa partire il timer che ogni 100 millisecondi controllerà la coda per aggiornare i testi e la barra
         self._timer.start(100)
 
-    def _controlla_coda(self):  # Controlla periodicamente la coda dei messaggi per aggiornare l'interfaccia grafica
+    def _controlla_coda(self):
+        """
+        Svuota la coda dei messaggi e aggiorna la finestra di conseguenza.
+
+        Chiamata dal timer ogni decimo di secondo, e' il punto in cui le
+        notizie del thread di sfondo diventano modifiche visibili: e' infatti
+        l'unico modo consentito, perche' i widget puo' toccarli solo il thread
+        principale. Riconosce quattro tipi di messaggio: 'stato' per il testo,
+        'barra_determinata' per il totale dei bandi, 'barra_valore' per
+        l'avanzamento e 'fine' per la conclusione.
+        """
         try:
             ## Ciclo infinito per svuotare TUTTI i messaggi accumulati nella coda in quel millesimo di secondo
             while True:
@@ -1330,7 +1537,7 @@ class BandiPistoiaApp(QMainWindow):
         """
         Adattatore fra la GUI e il motore condiviso avvia_ricerca_bandi.
 
-        Non contiene piu' la logica di scraping (quella e' nel motore, identico
+        Non contiene la logica di scraping (quella e' nel motore, identico
         a quello della web app): qui si limita a tradurre fra i due mondi.
         - segnala_progresso -> messaggi 'barra_determinata'/'barra_valore'/'stato'
           che la coda della GUI gia' sa interpretare;
@@ -1353,6 +1560,7 @@ class BandiPistoiaApp(QMainWindow):
             self._barra_impostata = False
 
             def _progresso(fatti, totale):
+                """Traduce l'avanzamento del motore in messaggi per la coda."""
                 if not self._barra_impostata:
                     self._coda.put({"tipo": "barra_determinata", "totale": totale})
                     self._barra_impostata = True
@@ -1361,6 +1569,7 @@ class BandiPistoiaApp(QMainWindow):
                 self._coda.put({"tipo": "barra_valore", "valore": fatti})
 
             def _deve_fermarsi():
+                """Riferisce al motore se l'utente ha premuto Interrompi."""
                 return self._interrompi.is_set()
 
             # Chiamata al motore condiviso: stessa logica della web app.
@@ -1397,8 +1606,15 @@ class BandiPistoiaApp(QMainWindow):
         except Exception as e:
             self._coda.put({"tipo": "fine", "percorso": None, "testo": f"Errore: {e}"})
 
-    def _fine_ricerca(self, percorso_file,
-                      messaggio):  # Ripristina l'interfaccia al termine dello scraping o in caso di interruzione
+    def _fine_ricerca(self, percorso_file, messaggio):
+        """
+        Riporta la finestra allo stato di riposo e mostra il verdetto.
+
+        Sblocca i filtri, ripristina il pulsante Avvia, nasconde la barra e
+        scrive il messaggio finale: verde se il file e' stato prodotto,
+        arancione se la ricerca e' stata interrotta, non ha dato risultati o
+        si e' fermata per un errore.
+        """
 
         self._ricerca_in_corso = False  # Reset dello stato interno, dice che non c'è più nessuna ricerca in corso
 

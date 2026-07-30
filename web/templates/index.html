@@ -1,4 +1,31 @@
 <!DOCTYPE html>
+<!--
+  Pagina dell'interfaccia web dello scraper dei bandi.
+
+  Viene servita da web/app.py, che la riempie all'apertura con le voci dei
+  menu (stati, tipologie, scelte del contraente, giorni, mesi, anni): non
+  sono scritte qui, arrivano dalle mappe del server, cosi' aggiungere una
+  tipologia significa modificare un solo punto del progetto.
+
+  Come dialoga col server
+    Una ricerca dura tanto, troppo perche' una singola risposta HTTP possa
+    attenderne la fine. Il lavoro e' quindi diviso in tre momenti:
+
+      1. POST /avvia         invia i filtri; il server fa partire la ricerca
+                             in sottofondo e risponde subito con un id_job
+      2. GET  /stato/<id>    ogni 2 secondi si chiede a che punto e': e' cosi'
+                             che avanza la barra (funzione controlla)
+      3. GET  /scarica/<f>   a lavoro concluso, il collegamento al file Excel
+
+    L'interruzione segue la stessa logica: POST /interrompi/<id> alza una
+    bandiera e la ricerca si ferma alla fine del bando in corso.
+
+  Il file e' diviso in tre parti: <style> con l'aspetto grafico, il <body>
+  con la struttura della pagina, e <script> con il comportamento.
+
+  Nota: tutto cio' che sta qui dentro, commenti compresi, viene inviato al
+  browser ed e' visibile con "Mostra sorgente pagina".
+-->
 <html lang="it">
 <head>
   <meta charset="UTF-8">
@@ -377,6 +404,16 @@
       return `${a}-${m}-${g}`;
     }
 
+    // Avvia la ricerca: valida i filtri, li invia al server e passa la mano
+    // alla sorveglianza dell'avanzamento.
+    //
+    // I controlli sono gli stessi che rifa' il server: qui servono a dare una
+    // risposta immediata, la' a garantire che valgano davvero, perche' quelli
+    // fatti nel browser si possono aggirare.
+    //
+    // saltaAnac diventa true solo quando l'utente, avvisato che i server ANAC
+    // non rispondono, sceglie di procedere lo stesso: la tabella avra' le
+    // colonne ANAC vuote.
     async function avvia(saltaAnac = false) {
       const btn = document.getElementById("avvia");
       const msg = document.getElementById("messaggio");
@@ -476,6 +513,13 @@
       }
     }
 
+    // Sorveglia una ricerca gia' avviata, interrogando il server ogni due
+    // secondi (setInterval) finche' non arriva uno stato conclusivo.
+    //
+    // E' l'unico modo per seguire un lavoro che gira sul server: la pagina non
+    // puo' esserne avvisata, deve chiedere. A ogni risposta aggiorna la barra;
+    // quando lo stato diventa "finito", "interrotto" o "errore" ferma le
+    // interrogazioni e mostra il verdetto con l'eventuale link di scaricamento.
     function controlla(idJob) {
       intervallo = setInterval(async () => {
         try {
@@ -543,12 +587,16 @@
       // Lo stato "interrotto" arrivera' dal polling, che chiamera' ripristina().
     }
 
+    // Mostra un messaggio di errore nel riquadro sotto i pulsanti.
     function mostraErrore(testo) {
       const msg = document.getElementById("messaggio");
       msg.className = "messaggio errore";
       msg.textContent = testo;
     }
 
+    // Riporta la pagina allo stato di riposo: pulsante Avvia di nuovo attivo,
+    // filtri sbloccati, barra nascosta. Si usa sia a fine ricerca sia quando
+    // qualcosa e' andato storto prima di iniziare.
     function ripristina() {
       const btn = document.getElementById("avvia");
       btn.disabled = false;
@@ -581,6 +629,7 @@
       }
     }
 
+    // Scorciatoia: valore di un campo, ripulito dagli spazi ai bordi.
     function val(id) { return document.getElementById(id).value.trim(); }
 
     // Riporta tutti i filtri allo stato iniziale: campi vuoti, menu sulla prima
