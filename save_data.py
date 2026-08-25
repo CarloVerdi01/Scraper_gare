@@ -1,15 +1,13 @@
 """
 Generazione del file Excel con i risultati della ricerca.
 
-Ultimo anello della catena: riceve i bandi gia' raccolti e arricchiti dalle
-altre parti del programma e li trasforma in una tabella formattata.
+Riceve i bandi gia' raccolti dalle
+altre parti del programma e li trasforma in una tabella.
 
 La forma della tabella
     Una riga per OPERATORE INVITATO, per ogni lotto — non una riga per bando.
     Un bando multi-lotto con dieci invitati occupa quindi molte righe, in cui
-    i dati della gara si ripetono. E' una scelta voluta: cosi' si puo'
-    filtrare per operatore e contare le sue ricorrenze, cosa impossibile se
-    tutti gli invitati stessero ammassati in una cella sola.
+    i dati della gara si ripetono.
 
     Le venti colonne uniscono le tre fonti: sito della Provincia, PDF di
     esito e API ANAC. I lotti sono distinti da colori diversi, per rendere
@@ -17,8 +15,7 @@ La forma della tabella
 
 Il filtro per operatore
     Se salva_in_excel riceve una P.IVA, la tabella si restringe ai soli bandi
-    in cui quel soggetto compare fra gli invitati. Il riconoscimento avviene
-    solo sul codice dichiarato nel documento, mai sulla ragione sociale.
+    in cui quel soggetto compare fra gli invitati.
 
 Se non viene indicato un nome, il file si chiama bandi_pistoia_ seguito da
 data e ora.
@@ -33,7 +30,7 @@ from console import log  # stampa solo se console.VERBOSE e' acceso
 
 # =====================================================================
 # COLORI DEI LOTTI
-# Un bando multi-lotto occupa molte righe consecutive : senza un segno visivo i blocchi
+# Un bando multi-lotto occupa molte righe consecutive: senza un segno visivo i blocchi
 # si fondono, e bandi multi-lotto CONSECUTIVI diventano indistinguibili.
 #
 # Lo schema e' a due livelli:
@@ -43,11 +40,6 @@ from console import log  # stampa solo se console.VERBOSE e' acceso
 #     primo all'ultimo.
 # Cosi' si legge a colpo d'occhio "stesso bando, lotto diverso" senza
 # confondere due gare vicine.
-#
-# Le scale restano CHIARE anche nella tonalita' piu' scura: il testo deve
-# restare leggibile e la riga del vincitore (gialla) deve risaltare sopra
-# qualunque di questi sfondi.
-# I bandi mono-lotto restano su sfondo bianco.
 # =====================================================================
 FAMIGLIE_COLORE = [
     ["EDF4FC", "DCE9F7", "CBDFF2", "BAD4ED", "A9C9E8", "98BFE3"],  # azzurro
@@ -60,10 +52,6 @@ FAMIGLIE_COLORE = [
 
 GIALLO_VINCITORE = "FFF2A8"
 TESTO_NESSUN_INVITATO = "lista invitati non presente"
-# Il PDF di esito NON esiste per quella gara: e' un caso diverso dal PDF che
-# c'e' ma non elenca gli invitati (TESTO_NESSUN_INVITATO). Distinguerli conta:
-# nel primo caso non si sa nulla, nel secondo si sa che la stazione appaltante
-# non ha pubblicato la lista.
 TESTO_PDF_ASSENTE = "PDF non presente"
 
 
@@ -88,7 +76,7 @@ def _codici_aggiudicatario(dati_anac, lotto):
     ANAC pubblica solo il CODICE_FISCALE (mai la P.IVA) e negli RTI/ATI ne
     elenca uno per ogni membro del raggruppamento: si restituisce quindi un
     INSIEME di codici, e l'invitato risulta vincitore se coincide con almeno
-    uno di essi — altrimenti si perderebbero le aggiudicazioni ai gruppi.
+    uno di essi.
     """
     codici = set()
     for c in str((dati_anac or {}).get("aggiudicatario_cf", "")).split(","):
@@ -108,8 +96,7 @@ def _codici_aggiudicatario(dati_anac, lotto):
 def _nome_aggiudicatario(dati_anac, lotto):
     """
     Nome dell'aggiudicatario: ANAC prima, PDF come ripiego, "Deserto" sui
-    lotti andati deserti (nessuna delle due fonti ha un aggiudicatario
-    perche' non esiste).
+    lotti andati deserti.
     """
     nome = (dati_anac or {}).get("aggiudicatario", "")
     if nome and nome != "Non presente":
@@ -136,9 +123,7 @@ def _codice_aggiudicatario_visibile(dati_anac, lotto):
 
 def _invitati_del_lotto(dati_pdf, lotto):
     """
-    Invitati che competono a un lotto: quelli propri del lotto se ci sono,
-    altrimenti quelli dichiarati a livello di gara (nei bandi mono-lotto e in
-    diversi multi-lotto la lista e' unica per tutta la gara).
+    Invitati che competono a un lotto
     """
     propri = (lotto or {}).get("invitati") or []
     if propri:
@@ -149,8 +134,7 @@ def _invitati_del_lotto(dati_pdf, lotto):
 def _etichetta_lotto(lotto, indice, totale):
     """
     "Lotto singolo" oppure "Multilotto - LOTTO N". Il nome del lotto si
-    prende dal PDF quando c'e' (i lotti possono essere numerati con salti,
-    es. 1-3-4, o essere lettere), altrimenti si ripiega sulla posizione.
+    prende dal PDF quando c'e', altrimenti si ripiega sulla posizione.
     """
     if totale <= 1:
         return "Lotto singolo"
@@ -161,7 +145,7 @@ def _etichetta_lotto(lotto, indice, totale):
 def _righe_da_bando(bando, piva_cercata=None):
     """
     Trasforma un bando nelle sue righe di tabella: UNA RIGA PER INVITATO, per
-    ogni lotto. E' la forma che permette di filtrare per operatore e contarne
+    ogni lotto. E' la modalità che permette di filtrare per operatore e contarne
     le ricorrenze, cosa impossibile se gli invitati stessero tutti in una cella.
 
     Con la ricerca per operatore attiva si emette una sola riga per lotto —
@@ -182,18 +166,36 @@ def _righe_da_bando(bando, piva_cercata=None):
 
     righe = []
     for i, lotto in enumerate(lotti, 1):
-        # CIG del lotto: non esiste un CIG di gara che comprenda tutti i lotti,
-        # ogni lotto ha il suo. Si ripiega sul CIG corrente del ciclo quando il
-        # PDF non lo dichiara.
-        cig = (lotto or {}).get("cig_lotto", "Non presente")
-        if not cig or cig == "Non presente":
-            cig = bando.get("cig_corrente", "Non trovato")
+        # CIG della riga: si usa quello del ciclo (cig_corrente), cioe' il
+        # codice risolto da risolvi_cig/costruisci_lista_cig e realmente
+        # inviato ad ANAC. E' l'unico modo perche' la riga sia coerente: il
+        # CIG mostrato e i dati ANAC accanto provengono cosi' dallo stesso
+        # codice. La pagina guida sempre, tranne quando il suo CIG e' monco:
+        # in quel caso risolvi_cig ha gia' promosso il codice pieno del PDF
+        # a monte, e cig_corrente lo contiene.
+        #
+        # Il CIG dichiarato dal lotto nel PDF (cig_lotto) resta come ripiego
+        # per i casi in cui la pagina non espone alcun codice. Quando i due
+        # divergono per un refuso prevale la pagina,
+        # coerentemente con costruisci_lista_cig.
+        #
+        # L'orchestrazione restringe dati_pdf al solo lotto di questo CIG
+        # prima di chiamare la generazione delle righe, quindi cig_corrente
+        # corrisponde sempre al lotto della riga.
+        cig = bando.get("cig_corrente", "Non trovato")
+        if not cig or cig in ("Non trovato", "Non presente", "N.A."):
+            _lotto_cig = (lotto or {}).get("cig_lotto", "Non presente")
+            # Se nemmeno il lotto dichiara un codice si conserva "Non trovato",
+            # l'etichetta che risolvi_cig assegna quando la ricerca del CIG e'
+            # stata fatta senza esito: distinta da "Non presente", che nel resto
+            # del progetto indica un campo mai valorizzato.
+            cig = _lotto_cig if _lotto_cig != "Non presente" else "Non trovato"
 
         # Numero REALE del lotto: quando main.py ha ristretto i dati a un solo
         # lotto, la posizione nella lista e' sempre 1 e tutti i lotti
         # prenderebbero lo stesso colore. Si ricava allora dal nome, che puo'
         # essere numerico ("LOTTO 3") oppure una LETTERA ("LOTTO A", "LOTTO B"):
-        # senza il caso delle lettere i bandi a lotti alfabetici finivano tutti
+        # senza il caso delle lettere i bandi a lotti alfabetici finirebbero tutti
         # sulla prima tonalita'.
         _nome_lotto = str((lotto or {}).get("nome_lotto") or "")
         _m_num = re.search(r'(\d+)', _nome_lotto)
@@ -283,8 +285,8 @@ def _righe_da_bando(bando, piva_cercata=None):
                 # presente e sempre identico per tutti i lotti di una gara.
                 # Il NUMERO_GARA di ANAC sembrerebbe piu' appropriato, ma non e'
                 # affidabile: di solito i lotti lo condividono, pero' capita che
-                # ANAC ne assegni uno DIVERSO a ciascuno, e in quel caso il
-                # bando si spezzerebbe in 8 famiglie di colore. Resta come
+                # ANAC ne assegni uno DIVERSO a ciascuno e in quel caso il
+                # bando si spezzerebbe in colori diversi. Resta come
                 # ripiego per l'eventualita' che l'URL manchi.
                 "chiave_bando": (dati_pagina.get("url_provincia", "")
                                  or str(dati_anac.get("numero_gara", "")).strip()),
@@ -304,7 +306,7 @@ def _righe_da_bando(bando, piva_cercata=None):
 
 def salva_in_excel(lista_bandi, nome_file=None, piva_invitato=None):
     """
-    Scrive la tabella dei bandi, con UNA RIGA PER INVITATO.
+    Scrive la tabella dei bandi.
 
     piva_invitato, se valorizzato, restringe la tabella: solo i bandi in cui
     l'operatore compare e, per ciascun lotto, la sola riga che lo riguarda.

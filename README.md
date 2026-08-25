@@ -183,9 +183,11 @@ di bandi richiede quindi diversi minuti: e' normale.
 I server ANAC sono spesso lenti o momentaneamente irraggiungibili, quindi ogni
 CIG viene ritentato fino a dieci volte, gestendo anche i blocchi per eccesso di
 richieste (errore 429). `gui.py` e `app.py` controllano inoltre che il servizio
-risponda **prima** di iniziare, ed avvisano l'utente se le colonne ANAC
-rischiano di restare vuote. `main.py` non fa questo controllo preliminare: parte
-comunque e l'esito si vede dai messaggi in console.
+risponda **prima** di iniziare: se non risponde la ricerca non parte, compare un
+avviso e il pulsante diventa "Procedi senza dati ANAC". Solo premendolo una
+seconda volta l'estrazione comincia, accettando che le colonne ANAC restino
+vuote. `main.py` non fa questo controllo preliminare: parte comunque e l'esito
+si vede dai messaggi in console.
 
 ### Riconoscimento degli operatori
 
@@ -196,9 +198,22 @@ documento non dice. I bandi che elencano gli invitati senza P.IVA ne' codice
 fiscale restano quindi esclusi dal risultato. E' una scelta voluta: una riga
 mancante e' visibile e onesta, una riga sbagliata no.
 
+### Verbali che non elencano gli invitati
+
+Alcuni verbali riportano l'elenco dei manifestanti e la data di spedizione delle
+lettere d'invito, ma non elencano i destinatari. In quei bandi gli invitati sono
+tutti i manifestanti: e' la prassi confermata dalla stazione appaltante, e il
+programma li registra come tali.
+
+La regola si aggancia alla dichiarazione di spedizione, non alla semplice
+assenza della sezione: un verbale che tace sull'invito conserva la lista vuota,
+coerentemente con il principio descritto qui sopra. Vale per tutti e quattro i
+formati di documento; nei verbali multi-lotto la verifica avviene lotto per
+lotto quando la dichiarazione compare dentro il singolo blocco.
+
 ### Limiti noti
 
 - I PDF **scansionati** (immagini senza testo) non sono leggibili: i campi
   documentali restano a "Non presente". Servirebbe un OCR.
 - Il programma dipende dalla struttura delle pagine della Provincia e dal
-  meccanismo di verifica dell'ANAC. Se cambiano, va aggiornato di conseguenza.
+  meccanismo di verifica dell'ANAC. Se cambiano, va aggiornato di conseguenza. 

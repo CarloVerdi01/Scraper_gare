@@ -7,10 +7,9 @@ condivisi, che questo file coordina tramite avvia_ricerca_bandi, funzione
 identica a quella di web/app.py.
 
 Come resta reattiva durante la ricerca
-    Una scansione dura tanto: eseguirla nel thread della finestra la
+    Una scansione dura minuti: eseguirla nel thread della finestra la
     congelerebbe. Gira percio' in un thread separato, che pero' non puo'
-    toccare i widget — in ogni libreria grafica solo il thread principale
-    puo' farlo. I due mondi comunicano quindi per messaggi:
+    toccare i widget. I due mondi comunicano quindi per messaggi:
 
         thread di sfondo  ->  queue.Queue  ->  QTimer  ->  finestra
 
@@ -42,7 +41,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QColor
-# Import completi per la ricerca condivisa con la web app.
 from scraper import (genera_url_con_filtri, estrai_lista_bandi, BASE_URL,
                      estrai_dati_json_anac, scarica_json_anac, estrai_dettagli_bando,
                      reimposta_via_anac)
@@ -56,15 +54,12 @@ def cartella_download():
     """
     Percorso della cartella Download dell'utente, o stringa vuota se non c'e'.
 
-    E' la destinazione predefinita dei file Excel: chi usa il programma
-    conosce la propria cartella Download, mentre non ha motivo di sapere dove
-    sia installato il progetto.
+    E' la destinazione predefinita dei file Excel.
 
     La stringa vuota fa da ripiego elegante: os.path.join("", "bandi.xlsx")
     restituisce "bandi.xlsx", cioe' il salvataggio nella cartella del
-    progetto, esattamente il comportamento di prima. Serve per i sistemi dove
-    la cartella non esiste o ha un altro nome: su Linux, per esempio, con
-    interfaccia in italiano puo' chiamarsi "Scaricati".
+    progetto. Serve per i sistemi dove
+    la cartella Download non esiste o ha un altro nome.
     """
     percorso = os.path.join(os.path.expanduser("~"), "Downloads")
     return percorso if os.path.isdir(percorso) else ""
@@ -282,7 +277,7 @@ def avvia_ricerca_bandi(parola_chiave="", cig="", stato="qualsiasi", tipologia="
     Restituisce
         Un dizionario con la chiave "anac_giu": True se ANAC e' stato
         interrogato ma non ha risposto per NESSUN CIG, cioe' se il servizio era
-        verosimilmente guasto. Serve ad avvisare che le colonne ANAC sono vuote
+        guasto. Serve ad avvisare che le colonne ANAC sono vuote
         per un guasto, non perche' quelle gare non fossero pubblicate.
         Restituisce None se l'utente ha interrotto la ricerca: in quel caso non
         viene prodotto alcun file.
@@ -529,7 +524,7 @@ def anac_raggiungibile(tentativi=3, pausa=2):
     ma quando ANAC risponde subito il controllo finisce in un colpo. Solo se
     TUTTI i tentativi falliscono il servizio e' considerato giu'.
     """
-    CIG_TEST = "A040010618"  # CIG reale e stabile (gia' verificato)
+    CIG_TEST = "A040010618"  # CIG reale e stabile (Chiesina Uzzanese, gia' verificato)
     for n in range(1, tentativi + 1):
         try:
             reimposta_via_anac()
@@ -581,6 +576,9 @@ class BandiPistoiaApp(QMainWindow):
         # predefinita. Il percorso NON si ricava dal testo dell'etichetta:
         # quel testo e' un'informazione per l'occhio, non un dato del programma.
         self._cartella_scelta = None
+        # True dopo che l'utente ha accettato di procedere senza dati ANAC:
+        # evita di richiedere la conferma a ogni click sul pulsante.
+        self._anac_confermato = False
         self._cartella_predefinita = cartella_download()
         self._etichetta_predefinita = ("Cartella Download (default)"
                                        if self._cartella_predefinita
@@ -1261,7 +1259,7 @@ class BandiPistoiaApp(QMainWindow):
         self.pulsante_reset.clicked.connect(self._reset_filtri)  # con il click esegue funzione '_reset_filtri'
 
         # Pulsante avvia ricerca
-        self.pulsante_ricerca = QPushButton("🔍  Avvia Ricerca")
+        self.pulsante_ricerca = QPushButton("Avvia ricerca")
         self.pulsante_ricerca.setFixedHeight(45)
         self.pulsante_ricerca.setStyleSheet("""
             QPushButton {
@@ -1303,6 +1301,10 @@ class BandiPistoiaApp(QMainWindow):
         self.campo_cig.clear()
         self.campo_nome_file.clear()
         self._cartella_scelta = None
+        # Azzera anche la conferma ANAC: dopo un ripristino il pulsante torna
+        # "Avvia Ricerca" e la verifica viene rifatta al prossimo avvio.
+        self._anac_confermato = False
+        self.pulsante_ricerca.setText("Avvia ricerca")
         self.label_cartella.setText(self._etichetta_predefinita)
         self.label_cartella.setStyleSheet("color: #7f8c8d; font-style: italic;")
         self.menu_stato.setCurrentIndex(0)
@@ -1331,7 +1333,7 @@ class BandiPistoiaApp(QMainWindow):
         # Se la ricerca è già attiva allora il click è avvenuto su interrompi
         if self._ricerca_in_corso:
             self._interrompi.set()  # interrompe il thread
-            self.etichetta_stato.setText("Interruzione richiesta... Attendere il bando in esecuzione.")
+            self.etichetta_stato.setText("Interruzione in corso...")
             self.pulsante_ricerca.setEnabled(False)  # disattiva il pulsante per evitare click multipli
             return
 
@@ -1360,6 +1362,24 @@ class BandiPistoiaApp(QMainWindow):
         # sistema operativo, e con destinazione vuota lascia il solo nome file,
         # cioe' la cartella del progetto.
         percorso = os.path.join(self._cartella_scelta or self._cartella_predefinita, nome)
+
+        # Verifica preventiva della disponibilita' ANAC, come nella web app.
+        # Se il servizio non risponde non si parte: si avvisa l'utente e lo si
+        # lascia decidere, perche' una scansione da decine di minuti che nasce
+        # gia' priva dei dati ANAC e' quasi sempre da rifare. Alla conferma il
+        # pulsante cambia etichetta e il secondo click avvia comunque.
+        if not self._anac_confermato and not anac_raggiungibile():
+            self._anac_confermato = True
+            self.etichetta_messaggio.setText(
+                "AVVISO: i server ANAC al momento non sono raggiungibili. "
+                "Puoi procedere comunque, ma l'estrazione sara' priva dei "
+                "dati ANAC (oggetto, CUP, CPV, aggiudicatario)."
+            )
+            self.etichetta_messaggio.setStyleSheet(
+                "color: #c0392b; font-weight: bold; padding: 6px;")
+            self.etichetta_messaggio.setVisible(True)
+            self.pulsante_ricerca.setText("Procedi senza dati ANAC")
+            return
 
         # Lancia la funzione che avvia lo scraping, passando il percorso in cui salvare
         self._avvia_ricerca(percorso)
@@ -1433,7 +1453,7 @@ class BandiPistoiaApp(QMainWindow):
         self._blocca_campi(True)  # Congela tutti i filtri durante la ricerca
 
         # Cambia l'aspetto e la funzione del tasto "Avvia", facendolo diventare "Interrompi" (rosso)
-        self.pulsante_ricerca.setText("⏹  Interrompi Ricerca")
+        self.pulsante_ricerca.setText("Interrompi ricerca")
         self.pulsante_ricerca.setStyleSheet("""
             QPushButton {
                 background-color: #d63031; 
@@ -1456,7 +1476,8 @@ class BandiPistoiaApp(QMainWindow):
         # Inizializza la barra di progresso
         self.barra.setMaximum(0)
         self.barra.show()
-        self.etichetta_stato.setText("Connessione al portale e analisi filtri...")
+        self.etichetta_stato.setText(
+            "Ricerca avviata. Puo' richiedere alcuni minuti, non chiudere la finestra.")
 
         # Raccolta dei filtri. Si passano le ETICHETTE (es. "Aggiudicata"): la
         # traduzione nei codici del sito la fa il motore, come per la web app.
@@ -1537,7 +1558,7 @@ class BandiPistoiaApp(QMainWindow):
         """
         Adattatore fra la GUI e il motore condiviso avvia_ricerca_bandi.
 
-        Non contiene la logica di scraping (quella e' nel motore, identico
+        Non contiene piu' la logica di scraping (quella e' nel motore, identico
         a quello della web app): qui si limita a tradurre fra i due mondi.
         - segnala_progresso -> messaggi 'barra_determinata'/'barra_valore'/'stato'
           che la coda della GUI gia' sa interpretare;
@@ -1546,13 +1567,10 @@ class BandiPistoiaApp(QMainWindow):
         Gira nel thread di sfondo che la GUI ha gia' avviato.
         """
         try:
-            # Controllo ANAC preventivo (nel thread, non blocca la finestra).
-            # Se non risponde si avvisa e si prosegue comunque: la tabella avra'
-            # le colonne ANAC vuote, come scelto per la web app.
-            self._coda.put({"tipo": "stato", "testo": "Verifica disponibilita' ANAC..."})
-            if not anac_raggiungibile():
-                self._coda.put({"tipo": "stato",
-                                "testo": "ANAC non raggiungibile: procedo senza dati ANAC..."})
+            # La disponibilita' ANAC e' gia' stata verificata prima di avviare
+            # il thread (_gestisci_pulsante), come nella web app: se il servizio
+            # non rispondeva, l'utente ha esplicitamente confermato di voler
+            # procedere senza quei dati. Qui non si ripete il controllo.
 
             # Progresso: il motore chiama con (fatti, totale). Al primo colpo si
             # imposta il massimo della barra; a ogni bando se ne aggiorna il valore
@@ -1564,8 +1582,12 @@ class BandiPistoiaApp(QMainWindow):
                 if not self._barra_impostata:
                     self._coda.put({"tipo": "barra_determinata", "totale": totale})
                     self._barra_impostata = True
+                # Percentuale sui bandi CONCLUSI (fatti - 1), come nella web
+                # app: la barra mostra il lavoro finito, la scritta quello in
+                # corso. Cosi' le due interfacce riportano lo stesso numero.
+                _perc = round(((fatti - 1) / totale) * 100) if totale else 0
                 self._coda.put({"tipo": "stato",
-                                "testo": f"Elaborazione bando {fatti} di {totale}..."})
+                                "testo": f"Elaborazione bando {fatti} di {totale} ({_perc}%)"})
                 self._coda.put({"tipo": "barra_valore", "valore": fatti})
 
             def _deve_fermarsi():
@@ -1625,7 +1647,7 @@ class BandiPistoiaApp(QMainWindow):
         self.etichetta_stato.setText("")  # Nasconde la scritta che mostrava i passaggi
 
         # Ripristina il pulsante principale, trasforma il pulsante rosso interrompi nel pulsante originale avvia ricerca
-        self.pulsante_ricerca.setText("🔍  Avvia Ricerca")
+        self.pulsante_ricerca.setText("Avvia ricerca")
         self.pulsante_ricerca.setStyleSheet("""
             QPushButton {
                 background-color: #1a73e8; 
