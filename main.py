@@ -12,10 +12,7 @@ Avvio
 
 Serve un terminale vero. I menu a freccette usano la libreria pick, che si
 appoggia a curses: in una console che non emula un terminale i menu non
-funzionano. In PyCharm va spuntata l'opzione "Emulate terminal in output
-console" nella configurazione di esecuzione (Run -> Edit Configurations),
-oppure si lancia il comando dal terminale integrato. La finestra grafica e
-l'interfaccia web non hanno questo vincolo.
+funzionano.
 
 Nota per chi legge il progetto: il nome "main" e' storico, questo non e' il
 punto di ingresso del programma. Le interfacce per l'uso normale sono gui.py

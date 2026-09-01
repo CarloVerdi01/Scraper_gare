@@ -1,11 +1,6 @@
 """
 Interruttore unico per i messaggi diagnostici dei moduli di logica.
 
-I moduli condivisi (scraper, scraper_pdf, save_data) non devono decidere DOVE
-finiscono i loro messaggi: non sanno se a chiamarli e' un terminale, una
-finestra PyQt o un server Flask. Si limitano quindi a dichiarare cosa sta
-succedendo con log(), e chi li usa decide se quei messaggi vanno mostrati.
-
 Uso:
     - main.py (versione da terminale, usata per il debug) accende l'interruttore:
 

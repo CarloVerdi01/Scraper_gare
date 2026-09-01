@@ -2,8 +2,7 @@
 Raccolta dei dati dal sito della Provincia di Pistoia e dall'API ANAC.
 
 Copre due delle tre fonti del programma (la terza, i PDF di esito, sta in
-scraper_pdf.py) e non dipende da nessuna interfaccia: e' lo stesso file per
-la finestra grafica, per la web app e per la versione da terminale.
+scraper_pdf.py).
 
 Dal sito della Provincia
     genera_url_con_filtri   costruisce l'indirizzo di ricerca dai filtri

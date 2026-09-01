@@ -8,8 +8,7 @@ usato solo per il debug da terminale; questa web app non lo importa.
 
 Versione SEMPLICE: la ricerca gira in un thread di sfondo (una scansione dura
 minuti e bloccherebbe la pagina), il browser ne interroga lo stato e a fine
-lavoro scarica l'Excel. L'avanzamento in tempo reale e' un passo successivo,
-gia' predisposto: lo stato del job tiene un campo pronto a ospitare il log.
+lavoro scarica l'Excel. .
 """
 import os
 import sys
