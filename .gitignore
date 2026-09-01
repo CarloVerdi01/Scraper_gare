@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.project
+.pydevproject
+.DS_Store
+web/output/
+*.xlsx
+build/
+dist/
+*.spec
